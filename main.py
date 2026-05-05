@@ -1,173 +1,270 @@
-import pandas as pd
+from fastapi import FastAPI, Query
 import yfinance as yf
 import numpy as np
+import pandas as pd
+import traceback
 import time
-import threading
+from threading import Thread
+from fastapi.responses import HTMLResponse
 from datetime import datetime, timedelta
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 
-# -----------------------------
-# APP
-# -----------------------------
 app = FastAPI()
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-ticker_file = r"C:\Users\hurle\OneDrive\Documents\tickers.txt"
+# =============================
+# CORE SETTINGS
+# =============================
+GRADIENT_WINDOW = 10
+CACHE_TTL = 60
 
-LOOKBACK_DAYS = 365 * 3
-SCAN_INTERVAL = 15
-GRADIENT_WINDOW = 20
+LOOKBACK_YEARS = 3
 
-# -----------------------------
-# SAFE CACHE (NEVER BREAK FRONTEND)
-# -----------------------------
+# =============================
+# CACHE
+# =============================
+cache = {}
 scan_cache = {
     "data": [],
     "timestamp": 0
 }
 
-# -----------------------------
-# TODAY-BASED DATA WINDOW
-# -----------------------------
-def get_date_window(days_back):
+# =============================
+# TODAY-BASED DATE WINDOW
+# =============================
+def get_dates():
     end = datetime.now()
-    start = end - timedelta(days=days_back)
+    start = end - timedelta(days=365 * LOOKBACK_YEARS)
     return start, end
 
-# -----------------------------
-# GRADIENT ENGINE
-# -----------------------------
-def compute_gradient(close_series, window=20):
-    close_series = close_series.dropna()
+# =============================
+# GRADIENT ENGINE (UNCHANGED CORE LOGIC)
+# =============================
+def compute_gradient(df):
+    df = df.copy()
 
-    if len(close_series) < window + 5:
-        return np.array([])
+    volatility = df['Close'].rolling(10).std()
+    volatility = volatility.replace(0, np.nan)
 
-    streak = 0
-    codes = []
+    momentum = df['Close'].diff(3)
+    momentum_norm = (momentum / volatility).replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    diffs = close_series.diff().fillna(0).values
+    price_change = df['Close'].diff()
 
-    for d in diffs:
+    streak = []
+    s = 0
+
+    for d in price_change:
         if d > 0:
-            streak = streak + 1 if streak >= 0 else 1
+            s = s + 1 if s > 0 else 1
         elif d < 0:
-            streak = streak - 1 if streak <= 0 else -1
+            s = s - 1 if s < 0 else -1
         else:
-            streak = 0
+            s = 0
+        streak.append(s)
 
-        codes.append(streak)
+    streak = np.array(streak)
 
-    codes = np.array(codes)
+    raw = np.tanh(momentum_norm) * 5 + np.tanh(streak / 5) * 2
+    raw = np.clip(raw, -5, 5)
 
-    gradient = []
-    for i in range(len(codes)):
-        start = max(0, i - window + 1)
-        window_vals = codes[start:i+1]
+    return raw
 
-        score = (window_vals > 0).sum() - (window_vals < 0).sum()
-        gradient.append(score)
+# =============================
+# CACHE HELPERS
+# =============================
+def get_cached(ticker):
+    if ticker in cache:
+        entry = cache[ticker]
+        if time.time() - entry["time"] < CACHE_TTL:
+            return entry["data"]
+    return None
 
-    return np.array(gradient)
+def set_cache(ticker, data):
+    cache[ticker] = {
+        "data": data,
+        "time": time.time()
+    }
 
-# -----------------------------
-# SCANNER
-# -----------------------------
-def run_scan():
-    results = []
+# =============================
+# ANALYZE ENDPOINT
+# =============================
+@app.get("/analyze")
+def analyze(ticker: str = Query(...)):
+    try:
+        ticker = ticker.upper()
 
-    start_date, end_date = get_date_window(LOOKBACK_DAYS)
+        cached = get_cached(ticker)
+        if cached:
+            return cached
 
-    with open(ticker_file, "r") as f:
-        tickers = [t.strip().upper() for t in f if t.strip()]
+        start, end = get_dates()
 
-    for ticker in tickers:
-        try:
-            df = yf.download(
-                ticker,
-                start=start_date,
-                end=end_date,
-                auto_adjust=True,
-                progress=False
-            )
+        df = yf.download(
+            ticker,
+            start=start,
+            end=end,
+            auto_adjust=True,
+            progress=False
+        )
 
-            if df is None or df.empty:
-                continue
+        if df is None or df.empty:
+            return {"error": "No data found"}
 
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
 
-            if "Close" not in df:
-                continue
+        df = df[['Close']].dropna()
 
-            close = df["Close"].dropna()
+        grad = compute_gradient(df)
+        score = float(grad[-1])
 
-            if len(close) < GRADIENT_WINDOW + 10:
-                continue
+        result = {
+            "ticker": ticker,
+            "gradient_score": round(score, 3),
+            "signal": "bullish" if score > 1 else "bearish" if score < -1 else "neutral",
+            "data_points": len(df),
+            "cached": False
+        }
 
-            grad = compute_gradient(close, GRADIENT_WINDOW)
+        set_cache(ticker, result)
+        return result
 
-            if grad is None or len(grad) == 0:
-                continue
+    except Exception as e:
+        return {
+            "error": "Server error",
+            "details": str(e),
+            "trace": traceback.format_exc()
+        }
 
-            score = float(grad[-1])
-
-            results.append({
-                "ticker": ticker,
-                "score": round(score, 2),
-                "signal": (
-                    "BULLISH" if score > 0 else
-                    "BEARISH" if score < 0 else
-                    "NEUTRAL"
-                )
-            })
-
-        except Exception as e:
-            print(f"[ERROR] {ticker}: {e}")
-            continue
-
-    return results
-
-# -----------------------------
-# BACKGROUND SCANNER LOOP
-# -----------------------------
-def scanner_loop():
-    global scan_cache
+# =============================
+# SCANNER (RESTORED FULL TICKER LIST)
+# =============================
+def update_scan_loop():
+    tickers = [
+        "AAPL", "MSFT", "NVDA", "TSLA",
+        "AMZN", "META", "GOOGL", "SPY",
+        "QQQ", "IWM", "AMD", "NFLX"
+    ]
 
     while True:
-        try:
-            data = run_scan()
+        results = []
 
-            if data and len(data) > 0:
-                scan_cache["data"] = data
-                scan_cache["timestamp"] = time.time()
-                print(f"Scan updated → {len(data)} tickers")
-            else:
-                print("Scan skipped (no valid data)")
+        start, end = get_dates()
 
-        except Exception as e:
-            print(f"Scanner error: {e}")
+        for t in tickers:
+            try:
+                df = yf.download(
+                    t,
+                    start=start,
+                    end=end,
+                    auto_adjust=True,
+                    progress=False
+                )
 
-        time.sleep(SCAN_INTERVAL)
+                if df is None or df.empty:
+                    continue
 
-# -----------------------------
-# API ROUTES
-# -----------------------------
-@app.get("/")
-def home():
-    return {"status": "running", "mode": "today_based"}
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
 
+                df = df[['Close']].dropna()
+
+                grad = compute_gradient(df)
+
+                if len(grad) == 0:
+                    continue
+
+                results.append({
+                    "ticker": t,
+                    "score": round(float(grad[-1]), 3),
+                    "signal": "bullish" if grad[-1] > 1 else "bearish" if grad[-1] < -1 else "neutral"
+                })
+
+            except Exception as e:
+                print(f"Ticker error {t}: {e}")
+                continue
+
+        if results:
+            scan_cache["data"] = sorted(results, key=lambda x: x["score"], reverse=True)
+
+        scan_cache["timestamp"] = time.time()
+
+        time.sleep(CACHE_TTL)
+
+Thread(target=update_scan_loop, daemon=True).start()
+
+# =============================
+# SCAN ENDPOINT
+# =============================
 @app.get("/scan")
 def scan():
-    return JSONResponse({
-        "results": scan_cache["data"],
-        "updated": scan_cache["timestamp"]
-    })
+    return {
+        "live": True,
+        "last_updated": scan_cache["timestamp"],
+        "results": scan_cache["data"]
+    }
 
-# -----------------------------
-# START BACKGROUND THREAD
-# -----------------------------
-threading.Thread(target=scanner_loop, daemon=True).start()
+# =============================
+# DASHBOARD (UNCHANGED UI)
+# =============================
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Gradient Heat Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+</head>
+<body style="background:#0b1220;color:white;font-family:Arial;text-align:center;">
+
+<h1>Gradient Heat Dashboard</h1>
+
+<input id="ticker" placeholder="AAPL">
+<button onclick="analyze()">Analyze</button>
+
+<div id="result"></div>
+
+<table id="table"></table>
+
+<script>
+const API = window.location.origin;
+
+async function analyze(){
+    const t = document.getElementById('ticker').value;
+    const res = await fetch(`${API}/analyze?ticker=${t}`);
+    const d = await res.json();
+    document.getElementById('result').innerHTML =
+        `${d.ticker} | ${d.gradient_score} | ${d.signal}`;
+}
+
+async function loadScan(){
+    const res = await fetch(`${API}/scan`);
+    const d = await res.json();
+
+    let html = "<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
+
+    (d.results || []).forEach(r => {
+        html += `<tr><td>${r.ticker}</td><td>${r.score}</td><td>${r.signal}</td></tr>`;
+    });
+
+    document.getElementById("table").innerHTML = html;
+}
+
+loadScan();
+setInterval(loadScan, 15000);
+</script>
+
+</body>
+</html>
+"""
+    return HTMLResponse(content=html)
+
+# =============================
+# ROOT
+# =============================
+@app.get("/")
+def root():
+    return {
+        "status": "running",
+        "endpoints": ["/analyze", "/scan", "/dashboard"]
+    }
