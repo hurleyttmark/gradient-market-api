@@ -6,70 +6,25 @@ import traceback
 import time
 from threading import Thread
 from fastapi.responses import HTMLResponse
-from datetime import datetime, timedelta
 
 app = FastAPI()
 
 # =============================
-# CORE SETTINGS
+# CONFIG
 # =============================
-GRADIENT_WINDOW = 10
+GRADIENT_WINDOW = 20
 CACHE_TTL = 60
 
-LOOKBACK_YEARS = 3
+TICKERS = [
+    "AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL",
+    "SPY","QQQ","IWM","NFLX","AMD"
+]
+
+cache = {}
+scan_cache = {"data": None, "timestamp": 0}
 
 # =============================
 # CACHE
-# =============================
-cache = {}
-scan_cache = {
-    "data": [],
-    "timestamp": 0
-}
-
-# =============================
-# TODAY-BASED DATE WINDOW
-# =============================
-def get_dates():
-    end = datetime.now()
-    start = end - timedelta(days=365 * LOOKBACK_YEARS)
-    return start, end
-
-# =============================
-# GRADIENT ENGINE (UNCHANGED CORE LOGIC)
-# =============================
-def compute_gradient(df):
-    df = df.copy()
-
-    volatility = df['Close'].rolling(10).std()
-    volatility = volatility.replace(0, np.nan)
-
-    momentum = df['Close'].diff(3)
-    momentum_norm = (momentum / volatility).replace([np.inf, -np.inf], np.nan).fillna(0)
-
-    price_change = df['Close'].diff()
-
-    streak = []
-    s = 0
-
-    for d in price_change:
-        if d > 0:
-            s = s + 1 if s > 0 else 1
-        elif d < 0:
-            s = s - 1 if s < 0 else -1
-        else:
-            s = 0
-        streak.append(s)
-
-    streak = np.array(streak)
-
-    raw = np.tanh(momentum_norm) * 5 + np.tanh(streak / 5) * 2
-    raw = np.clip(raw, -5, 5)
-
-    return raw
-
-# =============================
-# CACHE HELPERS
 # =============================
 def get_cached(ticker):
     if ticker in cache:
@@ -79,13 +34,147 @@ def get_cached(ticker):
     return None
 
 def set_cache(ticker, data):
-    cache[ticker] = {
-        "data": data,
-        "time": time.time()
-    }
+    cache[ticker] = {"data": data, "time": time.time()}
 
 # =============================
-# ANALYZE ENDPOINT
+# SAFE DATA LOADER (IMPORTANT FIX)
+# =============================
+def load_data(ticker):
+    df = yf.download(
+        ticker,
+        period="5y",          # longer history = more stable gradient
+        interval="1d",
+        auto_adjust=True,
+        progress=False
+    )
+
+    if df is None or df.empty:
+        return None
+
+    df = df[['Open','High','Low','Close','Volume']].dropna()
+
+    # force chronological order (IMPORTANT FIX)
+    df = df.sort_index()
+
+    return df
+
+# =============================
+# CORE ENGINE (YOUR LOGIC, STABILIZED)
+# =============================
+def compute_gradient(df):
+    df = df.copy()
+
+    # -----------------------------
+    # CANDLE METRICS
+    # -----------------------------
+    df['range'] = df['High'] - df['Low']
+    df['body'] = (df['Close'] - df['Open']).abs()
+
+    df['upper_wick'] = df['High'] - df[['Open','Close']].max(axis=1)
+    df['lower_wick'] = df[['Open','Close']].min(axis=1) - df['Low']
+
+    # -----------------------------
+    # SIGNAL
+    # -----------------------------
+    signal = []
+
+    for i in range(len(df)):
+        r = df['range'].iloc[i]
+        if r == 0:
+            signal.append(0)
+            continue
+
+        body = df['Close'].iloc[i] - df['Open'].iloc[i]
+        body_abs = abs(body)
+        upper = df['upper_wick'].iloc[i]
+        lower = df['lower_wick'].iloc[i]
+
+        s = 0
+
+        if body > 0:
+            if body_abs / r >= 0.65:
+                s = 1
+            elif lower >= 1.3 * body_abs:
+                s = 1
+            elif body_abs / r >= 0.25:
+                s = 1
+
+        elif body < 0:
+            if body_abs / r >= 0.65:
+                s = -1
+            elif upper >= 1.3 * body_abs:
+                s = -1
+            elif body_abs / r >= 0.25:
+                s = -1
+
+        signal.append(s)
+
+    df['signal'] = signal
+
+    # -----------------------------
+    # STREAK
+    # -----------------------------
+    streak = []
+    c = 0
+
+    for s in signal:
+        if s == 1:
+            c = c + 1 if c > 0 else 1
+        elif s == -1:
+            c = c - 1 if c < 0 else -1
+        else:
+            c = 0
+        streak.append(c)
+
+    df['streak'] = streak
+
+    # -----------------------------
+    # 3-DAY ENGULF (SAFE)
+    # -----------------------------
+    N = 3
+    scenario = np.zeros(len(df))
+
+    for i in range(2*N, len(df)):
+        first = df.iloc[i-2*N:i-N]
+        second = df.iloc[i-N:i]
+
+        f_open, f_close = first['Open'].iloc[0], first['Close'].iloc[-1]
+        s_open, s_close = second['Open'].iloc[0], second['Close'].iloc[-1]
+
+        s_body = abs(s_close - s_open)
+        s_range = second['High'].max() - second['Low'].min()
+
+        vol_ok = second['Volume'].sum() >= 1.25 * first['Volume'].mean() * N
+
+        if f_close < f_open and s_close > s_open and s_body >= 0.7 * s_range and vol_ok:
+            scenario[i] = 3
+
+        elif f_close > f_open and s_close < s_open and s_body >= 0.7 * s_range and vol_ok:
+            scenario[i] = -3
+
+    df['scenario'] = scenario
+
+    # -----------------------------
+    # GRADIENT SCORE
+    # -----------------------------
+    grad = []
+
+    for i in range(len(df)):
+        start = max(0, i - GRADIENT_WINDOW + 1)
+        window = df['streak'].iloc[start:i+1]
+
+        score = (window > 0).sum() - (window < 0).sum()
+
+        if df['scenario'].iloc[i] != 0:
+            score += int(np.sign(df['scenario'].iloc[i]))
+
+        score = max(-5, min(5, score))
+        grad.append(score)
+
+    return np.array(grad)
+
+# =============================
+# ANALYZE
 # =============================
 @app.get("/analyze")
 def analyze(ticker: str = Query(...)):
@@ -96,168 +185,70 @@ def analyze(ticker: str = Query(...)):
         if cached:
             return cached
 
-        start, end = get_dates()
+        df = load_data(ticker)
 
-        df = yf.download(
-            ticker,
-            start=start,
-            end=end,
-            auto_adjust=True,
-            progress=False
-        )
-
-        if df is None or df.empty:
-            return {"error": "No data found"}
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        df = df[['Close']].dropna()
+        if df is None:
+            return {"error": "No data returned from yfinance"}
 
         grad = compute_gradient(df)
-        score = float(grad[-1])
 
         result = {
             "ticker": ticker,
-            "gradient_score": round(score, 3),
-            "signal": "bullish" if score > 1 else "bearish" if score < -1 else "neutral",
-            "data_points": len(df),
-            "cached": False
+            "gradient_score": float(round(grad[-1], 3)),
+            "signal": "bullish" if grad[-1] > 1 else "bearish" if grad[-1] < -1 else "neutral",
+            "data_points": int(len(df))
         }
 
         set_cache(ticker, result)
         return result
 
     except Exception as e:
-        return {
-            "error": "Server error",
-            "details": str(e),
-            "trace": traceback.format_exc()
-        }
+        return {"error": str(e), "trace": traceback.format_exc()}
 
 # =============================
-# SCANNER (RESTORED FULL TICKER LIST)
+# SCANNER
 # =============================
-def update_scan_loop():
-    tickers = [
-        "AAPL", "MSFT", "NVDA", "TSLA",
-        "AMZN", "META", "GOOGL", "SPY",
-        "QQQ", "IWM", "AMD", "NFLX"
-    ]
-
+def scan_loop():
     while True:
         results = []
 
-        start, end = get_dates()
-
-        for t in tickers:
+        for t in TICKERS:
             try:
-                df = yf.download(
-                    t,
-                    start=start,
-                    end=end,
-                    auto_adjust=True,
-                    progress=False
-                )
-
-                if df is None or df.empty:
+                df = load_data(t)
+                if df is None:
                     continue
-
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-
-                df = df[['Close']].dropna()
 
                 grad = compute_gradient(df)
 
-                if len(grad) == 0:
-                    continue
-
                 results.append({
                     "ticker": t,
-                    "score": round(float(grad[-1]), 3),
+                    "score": float(round(grad[-1], 3)),
                     "signal": "bullish" if grad[-1] > 1 else "bearish" if grad[-1] < -1 else "neutral"
                 })
 
-            except Exception as e:
-                print(f"Ticker error {t}: {e}")
+            except:
                 continue
 
-        if results:
-            scan_cache["data"] = sorted(results, key=lambda x: x["score"], reverse=True)
-
+        scan_cache["data"] = sorted(results, key=lambda x: x["score"], reverse=True)
         scan_cache["timestamp"] = time.time()
 
         time.sleep(CACHE_TTL)
 
-Thread(target=update_scan_loop, daemon=True).start()
+Thread(target=scan_loop, daemon=True).start()
 
 # =============================
 # SCAN ENDPOINT
 # =============================
 @app.get("/scan")
 def scan():
-    return {
-        "live": True,
-        "last_updated": scan_cache["timestamp"],
-        "results": scan_cache["data"]
-    }
+    return scan_cache
 
 # =============================
-# DASHBOARD (UNCHANGED UI)
+# DASHBOARD
 # =============================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    html = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Gradient Heat Dashboard</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1"/>
-</head>
-<body style="background:#0b1220;color:white;font-family:Arial;text-align:center;">
-
-<h1>Gradient Heat Dashboard</h1>
-
-<input id="ticker" placeholder="AAPL">
-<button onclick="analyze()">Analyze</button>
-
-<div id="result"></div>
-
-<table id="table"></table>
-
-<script>
-const API = window.location.origin;
-
-async function analyze(){
-    const t = document.getElementById('ticker').value;
-    const res = await fetch(`${API}/analyze?ticker=${t}`);
-    const d = await res.json();
-    document.getElementById('result').innerHTML =
-        `${d.ticker} | ${d.gradient_score} | ${d.signal}`;
-}
-
-async function loadScan(){
-    const res = await fetch(`${API}/scan`);
-    const d = await res.json();
-
-    let html = "<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
-
-    (d.results || []).forEach(r => {
-        html += `<tr><td>${r.ticker}</td><td>${r.score}</td><td>${r.signal}</td></tr>`;
-    });
-
-    document.getElementById("table").innerHTML = html;
-}
-
-loadScan();
-setInterval(loadScan, 15000);
-</script>
-
-</body>
-</html>
-"""
-    return HTMLResponse(content=html)
+    return "<html><body><h1>Gradient Live</h1></body></html>"
 
 # =============================
 # ROOT
@@ -266,5 +257,6 @@ setInterval(loadScan, 15000);
 def root():
     return {
         "status": "running",
-        "endpoints": ["/analyze", "/scan", "/dashboard"]
+        "scan": "/scan",
+        "dashboard": "/dashboard"
     }
