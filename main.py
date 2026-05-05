@@ -4,14 +4,15 @@ import numpy as np
 import pandas as pd
 import traceback
 import time
+import os
 from threading import Thread
 from fastapi.responses import HTMLResponse
-
-app = FastAPI()
+from contextlib import asynccontextmanager
 
 # =============================
-# CONFIG
+# APP LIFECYCLE
 # =============================
+
 GRADIENT_WINDOW = 20
 CACHE_TTL = 60
 
@@ -21,11 +22,12 @@ TICKERS = [
 ]
 
 cache = {}
-scan_cache = {"data": None, "timestamp": 0}
+scan_cache = {"data": [], "timestamp": 0}
 
 # =============================
 # CACHE
 # =============================
+
 def get_cached(ticker):
     if ticker in cache:
         entry = cache[ticker]
@@ -37,45 +39,18 @@ def set_cache(ticker, data):
     cache[ticker] = {"data": data, "time": time.time()}
 
 # =============================
-# SAFE DATA LOADER (IMPORTANT FIX)
+# CORE ENGINE
 # =============================
-def load_data(ticker):
-    df = yf.download(
-        ticker,
-        period="5y",          # longer history = more stable gradient
-        interval="1d",
-        auto_adjust=True,
-        progress=False
-    )
 
-    if df is None or df.empty:
-        return None
-
-    df = df[['Open','High','Low','Close','Volume']].dropna()
-
-    # force chronological order (IMPORTANT FIX)
-    df = df.sort_index()
-
-    return df
-
-# =============================
-# CORE ENGINE (YOUR LOGIC, STABILIZED)
-# =============================
 def compute_gradient(df):
     df = df.copy()
+    df = df[['Open','High','Low','Close','Volume']].dropna()
 
-    # -----------------------------
-    # CANDLE METRICS
-    # -----------------------------
     df['range'] = df['High'] - df['Low']
     df['body'] = (df['Close'] - df['Open']).abs()
-
     df['upper_wick'] = df['High'] - df[['Open','Close']].max(axis=1)
     df['lower_wick'] = df[['Open','Close']].min(axis=1) - df['Low']
 
-    # -----------------------------
-    # SIGNAL
-    # -----------------------------
     signal = []
 
     for i in range(len(df)):
@@ -92,28 +67,16 @@ def compute_gradient(df):
         s = 0
 
         if body > 0:
-            if body_abs / r >= 0.65:
+            if body_abs / r >= 0.65 or lower >= 1.3 * body_abs or body_abs / r >= 0.25:
                 s = 1
-            elif lower >= 1.3 * body_abs:
-                s = 1
-            elif body_abs / r >= 0.25:
-                s = 1
-
         elif body < 0:
-            if body_abs / r >= 0.65:
-                s = -1
-            elif upper >= 1.3 * body_abs:
-                s = -1
-            elif body_abs / r >= 0.25:
+            if body_abs / r >= 0.65 or upper >= 1.3 * body_abs or body_abs / r >= 0.25:
                 s = -1
 
         signal.append(s)
 
     df['signal'] = signal
 
-    # -----------------------------
-    # STREAK
-    # -----------------------------
     streak = []
     c = 0
 
@@ -128,13 +91,10 @@ def compute_gradient(df):
 
     df['streak'] = streak
 
-    # -----------------------------
-    # 3-DAY ENGULF (SAFE)
-    # -----------------------------
     N = 3
     scenario = np.zeros(len(df))
 
-    for i in range(2*N, len(df)):
+    for i in range(2 * N, len(df)):
         first = df.iloc[i-2*N:i-N]
         second = df.iloc[i-N:i]
 
@@ -148,15 +108,11 @@ def compute_gradient(df):
 
         if f_close < f_open and s_close > s_open and s_body >= 0.7 * s_range and vol_ok:
             scenario[i] = 3
-
         elif f_close > f_open and s_close < s_open and s_body >= 0.7 * s_range and vol_ok:
             scenario[i] = -3
 
     df['scenario'] = scenario
 
-    # -----------------------------
-    # GRADIENT SCORE
-    # -----------------------------
     grad = []
 
     for i in range(len(df)):
@@ -168,54 +124,22 @@ def compute_gradient(df):
         if df['scenario'].iloc[i] != 0:
             score += int(np.sign(df['scenario'].iloc[i]))
 
-        score = max(-5, min(5, score))
-        grad.append(score)
+        grad.append(max(-5, min(5, score)))
 
     return np.array(grad)
 
 # =============================
-# ANALYZE
-# =============================
-@app.get("/analyze")
-def analyze(ticker: str = Query(...)):
-    try:
-        ticker = ticker.upper()
-
-        cached = get_cached(ticker)
-        if cached:
-            return cached
-
-        df = load_data(ticker)
-
-        if df is None:
-            return {"error": "No data returned from yfinance"}
-
-        grad = compute_gradient(df)
-
-        result = {
-            "ticker": ticker,
-            "gradient_score": float(round(grad[-1], 3)),
-            "signal": "bullish" if grad[-1] > 1 else "bearish" if grad[-1] < -1 else "neutral",
-            "data_points": int(len(df))
-        }
-
-        set_cache(ticker, result)
-        return result
-
-    except Exception as e:
-        return {"error": str(e), "trace": traceback.format_exc()}
-
-# =============================
 # SCANNER
 # =============================
+
 def scan_loop():
     while True:
         results = []
 
         for t in TICKERS:
             try:
-                df = load_data(t)
-                if df is None:
+                df = yf.download(t, period="1y", auto_adjust=True, progress=False)
+                if df is None or df.empty:
                     continue
 
                 grad = compute_gradient(df)
@@ -234,29 +158,55 @@ def scan_loop():
 
         time.sleep(CACHE_TTL)
 
-Thread(target=scan_loop, daemon=True).start()
+# =============================
+# FASTAPI LIFESPAN (FIXED FOR RENDER)
+# =============================
+
+@asynccontextmanager
+def lifespan(app: FastAPI):
+    thread = Thread(target=scan_loop, daemon=True)
+    thread.start()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 # =============================
-# SCAN ENDPOINT
+# ROUTES
 # =============================
+
 @app.get("/scan")
 def scan():
     return scan_cache
 
-# =============================
-# DASHBOARD
-# =============================
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    return "<html><body><h1>Gradient Live</h1></body></html>"
-
-# =============================
-# ROOT
-# =============================
 @app.get("/")
 def root():
-    return {
-        "status": "running",
-        "scan": "/scan",
-        "dashboard": "/dashboard"
-    }
+    return {"status": "running", "scan": "/scan", "dashboard": "/dashboard"}
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return """
+    <html>
+    <body>
+        <h1>Gradient Live Scanner</h1>
+        <pre id='data'>Loading...</pre>
+        <script>
+        async function load(){
+            const res = await fetch('/scan');
+            const data = await res.json();
+            document.getElementById('data').innerText = JSON.stringify(data, null, 2);
+        }
+        load();
+        setInterval(load, 5000);
+        </script>
+    </body>
+    </html>
+    """
+
+# =============================
+# LOCAL RUN
+# =============================
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
