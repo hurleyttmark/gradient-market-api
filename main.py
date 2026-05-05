@@ -7,11 +7,8 @@ import time
 import os
 from threading import Thread
 from fastapi.responses import HTMLResponse
-from contextlib import asynccontextmanager
 
-# =============================
-# APP LIFECYCLE
-# =============================
+app = FastAPI()
 
 GRADIENT_WINDOW = 20
 CACHE_TTL = 60
@@ -23,10 +20,6 @@ TICKERS = [
 
 cache = {}
 scan_cache = {"data": [], "timestamp": 0}
-
-# =============================
-# CACHE
-# =============================
 
 def get_cached(ticker):
     if ticker in cache:
@@ -129,7 +122,7 @@ def compute_gradient(df):
     return np.array(grad)
 
 # =============================
-# SCANNER
+# SCANNER LOOP
 # =============================
 
 def scan_loop():
@@ -150,7 +143,7 @@ def scan_loop():
                     "signal": "bullish" if grad[-1] > 1 else "bearish" if grad[-1] < -1 else "neutral"
                 })
 
-            except:
+            except Exception:
                 continue
 
         scan_cache["data"] = sorted(results, key=lambda x: x["score"], reverse=True)
@@ -159,16 +152,13 @@ def scan_loop():
         time.sleep(CACHE_TTL)
 
 # =============================
-# FASTAPI LIFESPAN (FIXED FOR RENDER)
+# STARTUP
 # =============================
 
-@asynccontextmanager
-def lifespan(app: FastAPI):
+@app.on_event("startup")
+def startup_event():
     thread = Thread(target=scan_loop, daemon=True)
     thread.start()
-    yield
-
-app = FastAPI(lifespan=lifespan)
 
 # =============================
 # ROUTES
@@ -201,10 +191,6 @@ def dashboard():
     </body>
     </html>
     """
-
-# =============================
-# LOCAL RUN
-# =============================
 
 if __name__ == "__main__":
     import uvicorn
