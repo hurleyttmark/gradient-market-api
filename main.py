@@ -3,26 +3,28 @@ import yfinance as yf
 import numpy as np
 import pandas as pd
 import time
+import os
 from threading import Thread
 from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
-# =========================
-# SETTINGS
-# =========================
+# =============================
+# CONFIG
+# =============================
+GRADIENT_WINDOW = 20
+CACHE_TTL = 60
+
 TICKERS = [
     "AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL",
     "SPY","QQQ","IWM","NFLX","AMD"
 ]
 
-GRADIENT_WINDOW = 20
-CACHE = {"data": [], "time": 0}
-CACHE_TTL = 60
+scan_cache = {"data": [], "timestamp": 0}
 
-# =========================
-# CORE LOGIC (SIMPLE VERSION)
-# =========================
+# =============================
+# CORE GRADIENT ENGINE
+# =============================
 def compute_gradient(df):
     df = df.copy()
     df = df[['Open','High','Low','Close','Volume']].dropna()
@@ -83,16 +85,16 @@ def compute_gradient(df):
 
     return np.array(grad)
 
-# =========================
+# =============================
 # SCANNER LOOP
-# =========================
-def scan():
+# =============================
+def scan_loop():
     while True:
         results = []
 
         for t in TICKERS:
             try:
-                df = yf.download(t, period="6mo", auto_adjust=True, progress=False)
+                df = yf.download(t, period="1y", auto_adjust=True, progress=False)
 
                 if df is None or df.empty:
                     continue
@@ -108,42 +110,47 @@ def scan():
             except:
                 continue
 
-        CACHE["data"] = sorted(results, key=lambda x: x["score"], reverse=True)
-        CACHE["time"] = time.time()
+        scan_cache["data"] = sorted(results, key=lambda x: x["score"], reverse=True)
+        scan_cache["timestamp"] = time.time()
 
         time.sleep(CACHE_TTL)
 
-# =========================
-# START THREAD (SAFE FOR RENDER)
-# =========================
+# =============================
+# STARTUP (RENDER SAFE)
+# =============================
 @app.on_event("startup")
 def startup():
-    Thread(target=scan, daemon=True).start()
+    thread = Thread(target=scan_loop, daemon=True)
+    thread.start()
 
-# =========================
-# ROUTES
-# =========================
+# =============================
+# API ROUTES
+# =============================
 @app.get("/scan")
-def get_scan():
-    return CACHE
+def scan():
+    return scan_cache
 
 @app.get("/")
 def home():
-    return {"status": "running", "endpoint": "/scan"}
+    return {"status": "running", "scan": "/scan", "dashboard": "/dashboard"}
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return """
     <html>
+    <head>
+        <title>Gradient Scanner</title>
+    </head>
     <body>
-        <h1>Gradient Scanner</h1>
+        <h2>Live Gradient Scanner</h2>
         <pre id="data">Loading...</pre>
 
         <script>
         async function load(){
             const res = await fetch('/scan');
             const data = await res.json();
-            document.getElementById('data').innerText = JSON.stringify(data, null, 2);
+            document.getElementById('data').innerText =
+                JSON.stringify(data, null, 2);
         }
 
         load();
@@ -153,9 +160,10 @@ def dashboard():
     </html>
     """
 
-# =========================
-# LOCAL RUN
-# =========================
+# =============================
+# LOCAL RUN (optional)
+# =============================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
