@@ -23,15 +23,24 @@ TICKERS = [
 scan_cache = {"data": [], "timestamp": 0}
 
 # =============================
-# CORE GRADIENT ENGINE
+# REGIME-AWARE GRADIENT ENGINE (NEW)
 # =============================
 def compute_gradient(df):
     df = df.copy()
     df = df[['Open','High','Low','Close','Volume']].dropna()
 
+    # -------------------------
+    # CORE FEATURES
+    # -------------------------
     df["range"] = df["High"] - df["Low"]
     df["body"] = (df["Close"] - df["Open"]).abs()
 
+    df["return"] = df["Close"].pct_change().fillna(0)
+    df["vol_change"] = df["Volume"].pct_change().fillna(0)
+
+    # -------------------------
+    # SIGNAL GENERATION
+    # -------------------------
     signals = []
 
     for i in range(len(df)):
@@ -43,27 +52,46 @@ def compute_gradient(df):
         body = df["Close"].iloc[i] - df["Open"].iloc[i]
         body_abs = abs(body)
 
+        vol = df["Volume"].iloc[i]
+        vol_ma = df["Volume"].rolling(10).mean().iloc[i]
+
         s = 0
 
+        # REGIME SHIFT DETECTION (NEW)
+        trend_strength = df["return"].rolling(5).mean().iloc[i]
+
+        # bullish regime
         if body > 0:
             if body_abs / r > 0.5:
                 s = 1
+            if trend_strength > 0:
+                s += 1
+            if vol_ma > 0 and vol > vol_ma:
+                s += 1
+
+        # bearish regime
         elif body < 0:
             if body_abs / r > 0.5:
                 s = -1
+            if trend_strength < 0:
+                s -= 1
+            if vol_ma > 0 and vol > vol_ma:
+                s -= 1
 
-        signals.append(s)
+        signals.append(np.clip(s, -3, 3))
 
     df["signal"] = signals
 
-    # streak
+    # -------------------------
+    # STREAK ENGINE
+    # -------------------------
     streak = []
     c = 0
 
     for s in signals:
-        if s == 1:
+        if s > 0:
             c = c + 1 if c > 0 else 1
-        elif s == -1:
+        elif s < 0:
             c = c - 1 if c < 0 else -1
         else:
             c = 0
@@ -71,17 +99,54 @@ def compute_gradient(df):
 
     df["streak"] = streak
 
-    # gradient score
+    # -------------------------
+    # SCENARIO BOOST (3-CANDLE REGIME)
+    # -------------------------
+    N = 3
+    scenario = np.zeros(len(df))
+
+    for i in range(2 * N, len(df)):
+        first = df.iloc[i-2*N:i-N]
+        second = df.iloc[i-N:i]
+
+        f_open, f_close = first["Open"].iloc[0], first["Close"].iloc[-1]
+        s_open, s_close = second["Open"].iloc[0], second["Close"].iloc[-1]
+
+        s_body = abs(s_close - s_open)
+        s_range = second["High"].max() - second["Low"].min()
+
+        vol_ok = second["Volume"].sum() >= 1.2 * first["Volume"].mean() * N
+
+        if f_close < f_open and s_close > s_open and s_body >= 0.6 * s_range and vol_ok:
+            scenario[i] = 3
+
+        elif f_close > f_open and s_close < s_open and s_body >= 0.6 * s_range and vol_ok:
+            scenario[i] = -3
+
+    df["scenario"] = scenario
+
+    # -------------------------
+    # FINAL GRADIENT SCORE (IMPROVED)
+    # -------------------------
     grad = []
 
     for i in range(len(df)):
-        start = max(0, i - GRADIENT_WINDOW)
+        start = max(0, i - GRADIENT_WINDOW + 1)
         window = df["streak"].iloc[start:i+1]
 
-        score = (window > 0).sum() - (window < 0).sum()
-        score = max(-5, min(5, score))
+        base = (window > 0).sum() - (window < 0).sum()
 
-        grad.append(score)
+        # scenario boost
+        if df["scenario"].iloc[i] != 0:
+            base += int(np.sign(df["scenario"].iloc[i])) * 2
+
+        # volatility expansion bias (NEW)
+        vol_boost = df["range"].iloc[i] / (df["range"].rolling(10).mean().iloc[i] + 1e-9)
+
+        if vol_boost > 1.5:
+            base += np.sign(base)
+
+        grad.append(max(-5, min(5, base)))
 
     return np.array(grad)
 
@@ -94,7 +159,14 @@ def scan_loop():
 
         for t in TICKERS:
             try:
-                df = yf.download(t, period="1y", auto_adjust=True, progress=False)
+                # ALWAYS FRESH DATA (fixes "old date" issue)
+                df = yf.download(
+                    t,
+                    period="6mo",
+                    interval="1d",
+                    auto_adjust=True,
+                    progress=False
+                )
 
                 if df is None or df.empty:
                     continue
@@ -103,8 +175,12 @@ def scan_loop():
 
                 results.append({
                     "ticker": t,
-                    "score": float(grad[-1]),
-                    "signal": "bullish" if grad[-1] > 1 else "bearish" if grad[-1] < -1 else "neutral"
+                    "score": float(round(grad[-1], 3)),
+                    "signal": (
+                        "bullish" if grad[-1] > 1
+                        else "bearish" if grad[-1] < -1
+                        else "neutral"
+                    )
                 })
 
             except:
@@ -116,33 +192,33 @@ def scan_loop():
         time.sleep(CACHE_TTL)
 
 # =============================
-# STARTUP (RENDER SAFE)
+# STARTUP
 # =============================
 @app.on_event("startup")
-def startup():
-    thread = Thread(target=scan_loop, daemon=True)
-    thread.start()
+def startup_event():
+    Thread(target=scan_loop, daemon=True).start()
 
 # =============================
-# API ROUTES
+# ROUTES
 # =============================
 @app.get("/scan")
 def scan():
     return scan_cache
 
 @app.get("/")
-def home():
-    return {"status": "running", "scan": "/scan", "dashboard": "/dashboard"}
+def root():
+    return {
+        "status": "running",
+        "scan": "/scan",
+        "note": "regime upgraded scanner active"
+    }
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return """
     <html>
-    <head>
-        <title>Gradient Scanner</title>
-    </head>
     <body>
-        <h2>Live Gradient Scanner</h2>
+        <h1>Gradient Regime Scanner</h1>
         <pre id="data">Loading...</pre>
 
         <script>
@@ -160,9 +236,6 @@ def dashboard():
     </html>
     """
 
-# =============================
-# LOCAL RUN (optional)
-# =============================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
