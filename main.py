@@ -1,5 +1,5 @@
 import matplotlib
-matplotlib.use("Agg")  # server-safe
+matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import io
@@ -11,22 +11,17 @@ from fastapi.responses import HTMLResponse, JSONResponse
 import yfinance as yf
 import numpy as np
 import pandas as pd
-import traceback
 import time
 from threading import Thread
 
 app = FastAPI()
 
-# =============================
-# SETTINGS
-# =============================
 CACHE_TTL = 60
-
 cache = {}
 scan_cache = {"data": None, "timestamp": 0}
 
 # =============================
-# GRADIENT ENGINE (REGIME)
+# GRADIENT ENGINE
 # =============================
 def compute_gradient(df):
     df = df.copy()
@@ -47,67 +42,61 @@ def compute_gradient(df):
     else:
         df["vol_boost"] = 0
 
-    regime = (
-        0.6 * df["trend"] +
-        0.3 * df["accel"] +
-        0.1 * df["vol_boost"]
-    )
+    regime = 0.6*df["trend"] + 0.3*df["accel"] + 0.1*df["vol_boost"]
 
     df["gradient"] = np.tanh(regime) * 5
     return df["gradient"].values
 
 # =============================
-# CACHE HELPERS
+# SINGLE ANALYZE (score + plot together)
 # =============================
-def get_cached(ticker):
-    if ticker in cache:
-        if time.time() - cache[ticker]["time"] < CACHE_TTL:
-            return cache[ticker]["data"]
-    return None
+@app.get("/analyze_full")
+def analyze_full(ticker: str = Query(...)):
+    ticker = ticker.upper()
 
-def set_cache(ticker, data):
-    cache[ticker] = {"data": data, "time": time.time()}
+    df = yf.download(ticker, period="6mo", auto_adjust=True, progress=False)
+    if df is None or df.empty:
+        return {"error": "No data"}
 
-# =============================
-# ANALYZE (GRADIENT SCORE)
-# =============================
-@app.get("/analyze")
-def analyze(ticker: str = Query(...)):
-    try:
-        ticker = ticker.upper()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-        cached = get_cached(ticker)
-        if cached:
-            return cached
+    df = df[["Close"]].dropna()
 
-        df = yf.download(ticker, period="3y", auto_adjust=True, progress=False)
-        if df is None or df.empty:
-            return {"error": "No data"}
+    grad = compute_gradient(df)
+    score = float(grad[-1])
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+    # ---------------- Plot ----------------
+    fig, ax = plt.subplots(figsize=(12, 4))
 
-        df = df[["Close"]].dropna()
+    ax.plot(df.index, df["Close"], color="black", linewidth=2)
 
-        grad = compute_gradient(df)
-        latest = float(grad[-1])
+    for i in range(1, len(df)):
+        g = grad[i]
+        color = (0, min(1, g/5), 0, 0.2) if g > 0 else (min(1, -g/5), 0, 0, 0.2)
+        ax.axvspan(df.index[i-1], df.index[i], color=color)
 
-        result = {
-            "ticker": ticker,
-            "gradient_score": round(latest, 3),
-            "signal": "bullish" if latest > 1 else "bearish" if latest < -1 else "neutral"
-        }
+    ax.set_title(f"{ticker} Gradient Chart")
+    ax.grid(alpha=0.2)
 
-        set_cache(ticker, result)
-        return result
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
 
-    except Exception as e:
-        return {"error": str(e), "trace": traceback.format_exc()}
+    img = base64.b64encode(buf.read()).decode()
+
+    return {
+        "ticker": ticker,
+        "score": round(score, 3),
+        "signal": "bullish" if score > 1 else "bearish" if score < -1 else "neutral",
+        "image": img
+    }
 
 # =============================
-# SCAN (HEATMAP)
+# SCAN LOOP
 # =============================
-def update_scan():
+def scan_loop():
     tickers = ["AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL"]
 
     while True:
@@ -116,12 +105,8 @@ def update_scan():
         for t in tickers:
             try:
                 df = yf.download(t, period="1y", auto_adjust=True, progress=False)
-
                 if df is None or df.empty:
                     continue
-
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
 
                 df = df[["Close"]].dropna()
                 grad = compute_gradient(df)
@@ -140,120 +125,135 @@ def update_scan():
 
         time.sleep(CACHE_TTL)
 
-Thread(target=update_scan, daemon=True).start()
+Thread(target=scan_loop, daemon=True).start()
 
 @app.get("/scan")
 def scan():
     return scan_cache
 
 # =============================
-# PLOT ENDPOINT (IMAGE)
-# =============================
-@app.get("/plot")
-def plot(ticker: str = Query(...)):
-    df = yf.download(ticker, period="6mo", auto_adjust=True, progress=False)
-
-    if df is None or df.empty:
-        return {"error": "No data"}
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    df = df[["Close"]].dropna()
-    grad = compute_gradient(df)
-
-    fig, ax = plt.subplots(figsize=(12,5))
-
-    ax.plot(df.index, df["Close"], color="black")
-
-    for i in range(1, len(df)):
-        g = grad[i]
-        color = (0, min(1, g/5), 0, 0.2) if g > 0 else (min(1, -g/5), 0, 0, 0.2)
-        ax.axvspan(df.index[i-1], df.index[i], color=color)
-
-    ax.set_title(f"{ticker.upper()} Gradient Chart")
-    ax.grid(alpha=0.2)
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    plt.close(fig)
-    buf.seek(0)
-
-    img = base64.b64encode(buf.read()).decode()
-
-    return JSONResponse({"image": img})
-
-# =============================
-# FULL DASHBOARD (RESTORED)
+# FULL DASHBOARD (ONE PAGE UI)
 # =============================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return """
-    <html>
-    <body style="background:#0f172a;color:white;text-align:center;font-family:Arial;">
+<html>
+<head>
+<style>
+body {
+    background:#0f172a;
+    color:white;
+    font-family:Arial;
+    text-align:center;
+}
 
-        <h1>🔥 Gradient Market Dashboard</h1>
+.container {
+    max-width:1100px;
+    margin:auto;
+}
 
-        <input id="t" placeholder="AAPL" />
-        <button onclick="run()">Analyze</button>
+.row {
+    display:flex;
+    gap:20px;
+    justify-content:center;
+    flex-wrap:wrap;
+}
 
-        <h2 id="score">Score: --</h2>
-        <h3 id="signal">Signal: --</h3>
+.card {
+    background:#1e293b;
+    padding:20px;
+    border-radius:12px;
+    min-width:280px;
+}
 
-        <br>
+#chart {
+    width:100%;
+    margin-top:20px;
+}
 
-        <button onclick="plot()">Load Chart</button>
-        <div id="chart"></div>
+table {
+    width:100%;
+    margin-top:20px;
+    border-collapse:collapse;
+}
 
-        <h2>📊 Live Heatmap</h2>
-        <button onclick="scan()">Refresh Scan</button>
-        <table id="table" style="margin:auto;"></table>
+td, th {
+    padding:10px;
+    border-bottom:1px solid #334155;
+}
+</style>
+</head>
 
-        <script>
-        async function run(){
-            let t = document.getElementById("t").value;
-            let r = await fetch("/analyze?ticker=" + t);
-            let d = await r.json();
+<body>
 
-            document.getElementById("score").innerText = "Score: " + d.gradient_score;
-            document.getElementById("signal").innerText = "Signal: " + d.signal;
-        }
+<div class="container">
 
-        async function plot(){
-            let t = document.getElementById("t").value;
-            let r = await fetch("/plot?ticker=" + t);
-            let d = await r.json();
+<h1>🔥 Gradient Trading Dashboard</h1>
 
-            document.getElementById("chart").innerHTML =
-                '<img style="width:95%" src="data:image/png;base64,' + d.image + '"/>';
-        }
+<input id="t" placeholder="AAPL" style="padding:10px"/>
+<button onclick="run()" style="padding:10px">Scan</button>
 
-        async function scan(){
-            let r = await fetch("/scan");
-            let d = await r.json();
+<div class="row">
 
-            let html = "<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
+    <div class="card">
+        <h2>Score</h2>
+        <h1 id="score">--</h1>
+    </div>
 
-            d.data.forEach(x => {
-                html += `<tr><td>${x.ticker}</td><td>${x.score}</td><td>${x.signal}</td></tr>`;
-            });
+    <div class="card">
+        <h2>Signal</h2>
+        <h1 id="signal">--</h1>
+    </div>
 
-            document.getElementById("table").innerHTML = html;
-        }
+</div>
 
-        scan();
-        </script>
+<img id="chart" />
 
-    </body>
-    </html>
-    """
+<h2>📊 Heatmap</h2>
+
+<table id="table"></table>
+
+</div>
+
+<script>
+
+async function run() {
+    let t = document.getElementById("t").value;
+
+    let r = await fetch("/analyze_full?ticker=" + t);
+    let d = await r.json();
+
+    document.getElementById("score").innerText = d.score;
+    document.getElementById("signal").innerText = d.signal;
+
+    document.getElementById("chart").src =
+        "data:image/png;base64," + d.image;
+}
+
+async function scan() {
+    let r = await fetch("/scan");
+    let d = await r.json();
+
+    let html = "<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
+
+    d.data.forEach(x => {
+        html += `<tr><td>${x.ticker}</td><td>${x.score}</td><td>${x.signal}</td></tr>`;
+    });
+
+    document.getElementById("table").innerHTML = html;
+}
+
+scan();
+
+</script>
+
+</body>
+</html>
+"""
 
 # =============================
 # ROOT
 # =============================
 @app.get("/")
 def root():
-    return {
-        "status": "LIVE",
-        "endpoints": ["/dashboard", "/analyze", "/scan", "/plot"]
-    }
+    return {"status": "running", "endpoints": ["/dashboard", "/analyze_full", "/scan"]}
