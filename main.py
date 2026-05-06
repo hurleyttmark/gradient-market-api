@@ -6,7 +6,7 @@ import io
 import base64
 
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 
 import yfinance as yf
 import numpy as np
@@ -16,9 +16,13 @@ from threading import Thread
 
 app = FastAPI()
 
+# =============================
+# SETTINGS
+# =============================
 CACHE_TTL = 60
 cache = {}
 scan_cache = {"data": None, "timestamp": 0}
+
 
 # =============================
 # GRADIENT ENGINE
@@ -42,20 +46,21 @@ def compute_gradient(df):
     else:
         df["vol_boost"] = 0
 
-    regime = 0.6*df["trend"] + 0.3*df["accel"] + 0.1*df["vol_boost"]
+    regime = 0.6 * df["trend"] + 0.3 * df["accel"] + 0.1 * df["vol_boost"]
     df["gradient"] = np.tanh(regime) * 5
 
     return df["gradient"].values
 
 
 # =============================
-# ANALYZE + PLOT (FIXED)
+# ANALYZE + PLOT (MAIN ENDPOINT)
 # =============================
 @app.get("/analyze_full")
 def analyze_full(ticker: str = Query(...)):
     ticker = ticker.upper()
 
     df = yf.download(ticker, period="6mo", auto_adjust=True, progress=False)
+
     if df is None or df.empty:
         return {"error": "No data"}
 
@@ -67,18 +72,20 @@ def analyze_full(ticker: str = Query(...)):
     grad = compute_gradient(df)
     score = float(grad[-1])
 
-    # ---------------- PLOT ----------------
-    fig, ax = plt.subplots(figsize=(12,4))
+    # =============================
+    # PLOT
+    # =============================
+    fig, ax = plt.subplots(figsize=(12, 4))
 
     ax.plot(df.index, df["Close"], color="white", linewidth=2)
 
     for i in range(1, len(df)):
         g = grad[i]
-        color = (0, min(1, g/5), 0, 0.25) if g > 0 else (min(1, -g/5), 0, 0, 0.25)
+        color = (0, min(1, g / 5), 0, 0.25) if g > 0 else (min(1, -g / 5), 0, 0, 0.25)
         ax.axvspan(df.index[i-1], df.index[i], color=color)
 
-    ax.set_facecolor("#0f172a")
-    fig.patch.set_facecolor("#0f172a")
+    ax.set_facecolor("#0b1220")
+    fig.patch.set_facecolor("#0b1220")
     ax.tick_params(colors="white")
     ax.set_title(f"{ticker} Gradient Chart", color="white")
 
@@ -101,7 +108,7 @@ def analyze_full(ticker: str = Query(...)):
 # SCAN LOOP
 # =============================
 def scan_loop():
-    tickers = ["AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL","SPY"]
+    tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "SPY"]
 
     while True:
         results = []
@@ -109,6 +116,7 @@ def scan_loop():
         for t in tickers:
             try:
                 df = yf.download(t, period="1y", auto_adjust=True, progress=False)
+
                 if df is None or df.empty:
                     continue
 
@@ -129,16 +137,20 @@ def scan_loop():
 
         time.sleep(CACHE_TTL)
 
+
 Thread(target=scan_loop, daemon=True).start()
 
 
+# =============================
+# SCAN ENDPOINT
+# =============================
 @app.get("/scan")
 def scan():
     return scan_cache
 
 
 # =============================
-# DASHBOARD (FIXED PRO UI)
+# DASHBOARD (ELEMENTOR READY)
 # =============================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -171,6 +183,7 @@ body {
     border-radius:12px;
     flex:1;
     min-width:250px;
+    text-align:center;
 }
 
 img {
@@ -189,9 +202,11 @@ td, th {
     padding:10px;
     border-bottom:1px solid #223;
 }
+
 button, input {
     padding:10px;
     border-radius:6px;
+    border:none;
 }
 </style>
 </head>
@@ -202,19 +217,21 @@ button, input {
 
 <h1>🔥 Gradient Dashboard</h1>
 
-<input id="t" placeholder="AAPL"/>
+<input id="t" placeholder="AAPL / TSLA / SPY"/>
 <button onclick="run()">Analyze</button>
 
 <div class="row">
+
     <div class="card">
-        <h2>Score</h2>
+        <h3>Score</h3>
         <h1 id="score">--</h1>
     </div>
 
     <div class="card">
-        <h2>Signal</h2>
+        <h3>Signal</h3>
         <h1 id="signal">--</h1>
     </div>
+
 </div>
 
 <img id="chart"/>
@@ -228,30 +245,36 @@ button, input {
 
 <script>
 
+const API = window.location.origin;  // IMPORTANT: auto works on Render + custom domains
+
 async function run(){
-    let t=document.getElementById("t").value;
+    let t = document.getElementById("t").value;
 
-    let r=await fetch("/analyze_full?ticker="+t);
-    let d=await r.json();
+    let r = await fetch(`${API}/analyze_full?ticker=${t}`);
+    let d = await r.json();
 
-    document.getElementById("score").innerText=d.score;
-    document.getElementById("signal").innerText=d.signal;
+    document.getElementById("score").innerText = d.score;
+    document.getElementById("signal").innerText = d.signal;
 
     document.getElementById("chart").src =
         "data:image/png;base64," + d.image;
 }
 
 async function scan(){
-    let r=await fetch("/scan");
-    let d=await r.json();
+    let r = await fetch(`${API}/scan`);
+    let d = await r.json();
 
-    let html="<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
+    let html = "<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
 
     d.data.forEach(x=>{
-        html+=`<tr><td>${x.ticker}</td><td>${x.score}</td><td>${x.signal}</td></tr>`;
+        html += `<tr>
+            <td>${x.ticker}</td>
+            <td>${x.score}</td>
+            <td>${x.signal}</td>
+        </tr>`;
     });
 
-    document.getElementById("table").innerHTML=html;
+    document.getElementById("table").innerHTML = html;
 }
 
 scan();
@@ -263,6 +286,12 @@ scan();
 """
 
 
+# =============================
+# ROOT
+# =============================
 @app.get("/")
 def root():
-    return {"status":"running","dashboard":"/dashboard"}
+    return {
+        "status": "running",
+        "endpoints": ["/dashboard", "/analyze_full", "/scan"]
+    }
