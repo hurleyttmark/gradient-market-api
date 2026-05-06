@@ -3,4 +3,4 @@ uvicorn
 yfinance
 numpy
 pandas
-matplotlib
+matplotlib==3.8.4
