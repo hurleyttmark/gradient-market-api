@@ -1,3 +1,10 @@
+import matplotlib
+matplotlib.use("Agg")  # IMPORTANT (server-safe)
+
+import matplotlib.pyplot as plt
+import io
+import base64
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi import FastAPI, Query
 import yfinance as yf
 import numpy as np
@@ -5,7 +12,6 @@ import pandas as pd
 import traceback
 import time
 from threading import Thread
-from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
@@ -24,12 +30,13 @@ scan_cache = {
     "timestamp": 0
 }
 
+# =============================
+# GRADIENT ENGINE (REGIME MODEL)
+# =============================
+
 def compute_gradient(df):
     df = df.copy()
 
-    # -------------------------
-    # BASE FEATURES
-    # -------------------------
     df['returns'] = df['Close'].pct_change()
     df['vol'] = df['returns'].rolling(10).std()
 
@@ -37,26 +44,16 @@ def compute_gradient(df):
     df['momentum'] = df['returns'] / df['vol']
     df['momentum'] = df['momentum'].replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    # -------------------------
-    # REGIME LOGIC (NEW)
-    # -------------------------
-
-    # Trend (smoothed momentum)
+    # REGIME COMPONENTS
     df['trend'] = df['momentum'].rolling(5).mean().fillna(0)
-
-    # Acceleration (change in momentum)
     df['accel'] = df['momentum'].diff().fillna(0)
 
-    # Volume confirmation (SAFE: only if exists)
     if 'Volume' in df.columns:
         df['vol_ma'] = df['Volume'].rolling(10).mean()
         df['vol_boost'] = np.where(df['Volume'] > df['vol_ma'], 1, 0)
     else:
         df['vol_boost'] = 0
 
-    # -------------------------
-    # FINAL SCORE
-    # -------------------------
     regime_raw = (
         0.6 * df['trend'] +
         0.3 * df['accel'] +
@@ -68,7 +65,7 @@ def compute_gradient(df):
     return df['gradient'].values
 
 # =============================
-# LIVE CACHE HELPERS
+# CACHE
 # =============================
 
 def get_cached(ticker):
@@ -80,13 +77,10 @@ def get_cached(ticker):
 
 
 def set_cache(ticker, data):
-    cache[ticker] = {
-        "data": data,
-        "time": time.time()
-    }
+    cache[ticker] = {"data": data, "time": time.time()}
 
 # =============================
-# TICKER ANALYZER (LIVE)
+# ANALYZE ENDPOINT
 # =============================
 @app.get("/analyze")
 def analyze(ticker: str = Query(...)):
@@ -108,32 +102,72 @@ def analyze(ticker: str = Query(...)):
         df = df[['Close']].dropna()
 
         grad = compute_gradient(df)
-        latest_score = float(grad[-1])
+        latest = float(grad[-1])
 
         result = {
             "ticker": ticker,
-            "gradient_score": round(latest_score, 3),
-            "signal": "bullish" if latest_score > 1 else "bearish" if latest_score < -1 else "neutral",
-            "data_points": len(df),
-            "cached": False
+            "gradient_score": round(latest, 3),
+            "signal": "bullish" if latest > 1 else "bearish" if latest < -1 else "neutral"
         }
 
         set_cache(ticker, result)
         return result
 
     except Exception as e:
-        return {
-            "error": "Server error",
-            "details": str(e),
-            "trace": traceback.format_exc()
-        }
+        return {"error": str(e), "trace": traceback.format_exc()}
 
 # =============================
-# BACKGROUND LIVE SCANNER
+# 📊 PLOT ENDPOINT (HEAT + PRICE)
+# =============================
+@app.get("/plot")
+def plot(ticker: str = Query(...)):
+    try:
+        df = yf.download(ticker, period="6mo", auto_adjust=True, progress=False)
+
+        if df is None or df.empty:
+            return {"error": "No data"}
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df = df[['Close']].dropna()
+
+        grad = compute_gradient(df)
+
+        fig, ax = plt.subplots(figsize=(12,5))
+
+        ax.plot(df.index, df['Close'], color='black', linewidth=2)
+
+        # gradient heat overlay
+        for i in range(1, len(df)):
+            g = grad[i]
+            color = (0, min(1, g/5), 0, 0.2) if g > 0 else (min(1, -g/5), 0, 0, 0.2)
+            ax.axvspan(df.index[i-1], df.index[i], color=color)
+
+        ax.set_title(f"{ticker.upper()} Price + Gradient Heat")
+        ax.grid(alpha=0.2)
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png")
+        plt.close(fig)
+        buf.seek(0)
+
+        img = base64.b64encode(buf.read()).decode()
+
+        return JSONResponse({
+            "ticker": ticker,
+            "image": img
+        })
+
+    except Exception as e:
+        return {"error": str(e)}
+
+# =============================
+# SCANNER LOOP
 # =============================
 
 def update_scan_loop():
-    tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL"]
+    tickers = ["AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL"]
 
     while True:
         results = []
@@ -168,81 +202,37 @@ def update_scan_loop():
 Thread(target=update_scan_loop, daemon=True).start()
 
 # =============================
-# LIVE SCANNER ENDPOINT
+# SCAN
 # =============================
 @app.get("/scan")
 def scan():
-    return {
-        "live": True,
-        "last_updated": scan_cache["timestamp"],
-        "results": scan_cache["data"]
-    }
+    return scan_cache
 
 # =============================
-# DASHBOARD (NEW FRONTEND)
+# DASHBOARD
 # =============================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    html = """
-    <!DOCTYPE html>
+    return """
     <html>
-    <head>
-        <title>Gradient Heat Dashboard</title>
-        <style>
-            body { font-family: Arial; background:#0f172a; color:white; text-align:center; }
-            input, button { padding:10px; margin:5px; font-size:16px; }
-            .card { margin-top:20px; padding:20px; background:#1e293b; display:inline-block; border-radius:10px; }
-            table { margin:auto; margin-top:20px; border-collapse: collapse; }
-            td, th { padding:10px 20px; border-bottom:1px solid #334155; }
-        </style>
-    </head>
-    <body>
-        <h1>🔥 Gradient Heat Dashboard</h1>
-
-        <input id="ticker" placeholder="Enter ticker (AAPL)" />
-        <button onclick="analyze()">Analyze</button>
-
-        <div class="card">
-            <h2 id="symbol">---</h2>
-            <h1 id="score">0</h1>
-            <div id="signal">---</div>
-        </div>
-
-        <h2>📊 Live Heatmap</h2>
-        <button onclick="loadScan()">Refresh Scan</button>
-        <table id="table"></table>
+    <body style='background:#0f172a;color:white;text-align:center;font-family:Arial;'>
+        <h1>Gradient Dashboard</h1>
+        <input id='t'/>
+        <button onclick='go()'>Run</button>
+        <div id='out'></div>
 
         <script>
-        async function analyze() {
-            const t = document.getElementById('ticker').value;
-            const res = await fetch(`/analyze?ticker=${t}`);
-            const data = await res.json();
-
-            document.getElementById('symbol').innerText = data.ticker;
-            document.getElementById('score').innerText = data.gradient_score;
-            document.getElementById('signal').innerText = data.signal;
+        async function go(){
+            let t=document.getElementById('t').value;
+            let r=await fetch('/plot?ticker='+t);
+            let d=await r.json();
+            document.getElementById('out').innerHTML=
+                '<img style="width:90%" src="data:image/png;base64,'+d.image+'"/>';
         }
-
-        async function loadScan() {
-            const res = await fetch('/scan');
-            const data = await res.json();
-
-            let html = '<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>';
-
-            data.results.forEach(r => {
-                html += `<tr><td>${r.ticker}</td><td>${r.score}</td><td>${r.signal}</td></tr>`;
-            });
-
-            document.getElementById('table').innerHTML = html;
-        }
-
-        loadScan();
-        setInterval(loadScan, 15000);
         </script>
     </body>
     </html>
     """
-    return HTMLResponse(content=html)
 
 # =============================
 # ROOT
@@ -250,10 +240,6 @@ def dashboard():
 @app.get("/")
 def root():
     return {
-        "message": "LIVE Gradient Heat API running",
-        "dashboard": "/dashboard",
-        "endpoints": {
-            "/analyze?ticker=AAPL": "live cached gradient score",
-            "/scan": "live market heatmap"
-        }
+        "status": "running",
+        "endpoints": ["/analyze", "/scan", "/plot", "/dashboard"]
     }
