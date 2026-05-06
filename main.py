@@ -43,12 +43,13 @@ def compute_gradient(df):
         df["vol_boost"] = 0
 
     regime = 0.6*df["trend"] + 0.3*df["accel"] + 0.1*df["vol_boost"]
-
     df["gradient"] = np.tanh(regime) * 5
+
     return df["gradient"].values
 
+
 # =============================
-# SINGLE ANALYZE (score + plot together)
+# ANALYZE + PLOT (FIXED)
 # =============================
 @app.get("/analyze_full")
 def analyze_full(ticker: str = Query(...)):
@@ -66,21 +67,23 @@ def analyze_full(ticker: str = Query(...)):
     grad = compute_gradient(df)
     score = float(grad[-1])
 
-    # ---------------- Plot ----------------
-    fig, ax = plt.subplots(figsize=(12, 4))
+    # ---------------- PLOT ----------------
+    fig, ax = plt.subplots(figsize=(12,4))
 
-    ax.plot(df.index, df["Close"], color="black", linewidth=2)
+    ax.plot(df.index, df["Close"], color="white", linewidth=2)
 
     for i in range(1, len(df)):
         g = grad[i]
-        color = (0, min(1, g/5), 0, 0.2) if g > 0 else (min(1, -g/5), 0, 0, 0.2)
+        color = (0, min(1, g/5), 0, 0.25) if g > 0 else (min(1, -g/5), 0, 0, 0.25)
         ax.axvspan(df.index[i-1], df.index[i], color=color)
 
-    ax.set_title(f"{ticker} Gradient Chart")
-    ax.grid(alpha=0.2)
+    ax.set_facecolor("#0f172a")
+    fig.patch.set_facecolor("#0f172a")
+    ax.tick_params(colors="white")
+    ax.set_title(f"{ticker} Gradient Chart", color="white")
 
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight")
+    plt.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     buf.seek(0)
 
@@ -93,11 +96,12 @@ def analyze_full(ticker: str = Query(...)):
         "image": img
     }
 
+
 # =============================
 # SCAN LOOP
 # =============================
 def scan_loop():
-    tickers = ["AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL"]
+    tickers = ["AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL","SPY"]
 
     while True:
         results = []
@@ -127,12 +131,14 @@ def scan_loop():
 
 Thread(target=scan_loop, daemon=True).start()
 
+
 @app.get("/scan")
 def scan():
     return scan_cache
 
+
 # =============================
-# FULL DASHBOARD (ONE PAGE UI)
+# DASHBOARD (FIXED PRO UI)
 # =============================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -141,34 +147,36 @@ def dashboard():
 <head>
 <style>
 body {
-    background:#0f172a;
+    background:#0b1220;
     color:white;
     font-family:Arial;
-    text-align:center;
+    margin:0;
 }
 
 .container {
-    max-width:1100px;
+    max-width:1200px;
     margin:auto;
+    padding:20px;
 }
 
 .row {
     display:flex;
     gap:20px;
-    justify-content:center;
     flex-wrap:wrap;
 }
 
 .card {
-    background:#1e293b;
+    background:#111c33;
     padding:20px;
     border-radius:12px;
-    min-width:280px;
+    flex:1;
+    min-width:250px;
 }
 
-#chart {
+img {
     width:100%;
     margin-top:20px;
+    border-radius:10px;
 }
 
 table {
@@ -179,7 +187,11 @@ table {
 
 td, th {
     padding:10px;
-    border-bottom:1px solid #334155;
+    border-bottom:1px solid #223;
+}
+button, input {
+    padding:10px;
+    border-radius:6px;
 }
 </style>
 </head>
@@ -188,13 +200,12 @@ td, th {
 
 <div class="container">
 
-<h1>🔥 Gradient Trading Dashboard</h1>
+<h1>🔥 Gradient Dashboard</h1>
 
-<input id="t" placeholder="AAPL" style="padding:10px"/>
-<button onclick="run()" style="padding:10px">Scan</button>
+<input id="t" placeholder="AAPL"/>
+<button onclick="run()">Analyze</button>
 
 <div class="row">
-
     <div class="card">
         <h2>Score</h2>
         <h1 id="score">--</h1>
@@ -204,12 +215,12 @@ td, th {
         <h2>Signal</h2>
         <h1 id="signal">--</h1>
     </div>
-
 </div>
 
-<img id="chart" />
+<img id="chart"/>
 
-<h2>📊 Heatmap</h2>
+<h2>📊 Scan</h2>
+<button onclick="scan()">Refresh</button>
 
 <table id="table"></table>
 
@@ -217,30 +228,30 @@ td, th {
 
 <script>
 
-async function run() {
-    let t = document.getElementById("t").value;
+async function run(){
+    let t=document.getElementById("t").value;
 
-    let r = await fetch("/analyze_full?ticker=" + t);
-    let d = await r.json();
+    let r=await fetch("/analyze_full?ticker="+t);
+    let d=await r.json();
 
-    document.getElementById("score").innerText = d.score;
-    document.getElementById("signal").innerText = d.signal;
+    document.getElementById("score").innerText=d.score;
+    document.getElementById("signal").innerText=d.signal;
 
     document.getElementById("chart").src =
         "data:image/png;base64," + d.image;
 }
 
-async function scan() {
-    let r = await fetch("/scan");
-    let d = await r.json();
+async function scan(){
+    let r=await fetch("/scan");
+    let d=await r.json();
 
-    let html = "<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
+    let html="<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
 
-    d.data.forEach(x => {
-        html += `<tr><td>${x.ticker}</td><td>${x.score}</td><td>${x.signal}</td></tr>`;
+    d.data.forEach(x=>{
+        html+=`<tr><td>${x.ticker}</td><td>${x.score}</td><td>${x.signal}</td></tr>`;
     });
 
-    document.getElementById("table").innerHTML = html;
+    document.getElementById("table").innerHTML=html;
 }
 
 scan();
@@ -251,9 +262,7 @@ scan();
 </html>
 """
 
-# =============================
-# ROOT
-# =============================
+
 @app.get("/")
 def root():
-    return {"status": "running", "endpoints": ["/dashboard", "/analyze_full", "/scan"]}
+    return {"status":"running","dashboard":"/dashboard"}
