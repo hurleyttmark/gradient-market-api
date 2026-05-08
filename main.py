@@ -1,230 +1,173 @@
 import pandas as pd
 import yfinance as yf
 import numpy as np
-import matplotlib.pyplot as plt
-from datetime import datetime
-from matplotlib.colors import LinearSegmentedColormap, Normalize
+import time
+import threading
+from datetime import datetime, timedelta
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+# -----------------------------
+# APP
+# -----------------------------
+app = FastAPI()
 
 # -----------------------------
 # CONFIG
 # -----------------------------
-symbol = "gddy"
-start_date = datetime(2021,1,13)
-end_date   = datetime(2023,1,17)
+ticker_file = r"C:\Users\hurle\OneDrive\Documents\tickers.txt"
 
-gradient_window = 20
-
-# -----------------------------
-# DOWNLOAD DATA
-# -----------------------------
-df = yf.download(symbol, start=start_date, end=end_date,
-                 auto_adjust=True, progress=False)
-
-df = df[['Open','High','Low','Close','Volume']].dropna()
+LOOKBACK_DAYS = 365 * 3
+SCAN_INTERVAL = 15
+GRADIENT_WINDOW = 20
 
 # -----------------------------
-# CANDLE METRICS
+# SAFE CACHE (NEVER BREAK FRONTEND)
 # -----------------------------
-df['range'] = df['High'] - df['Low']
-df['body'] = abs(df['Close'] - df['Open'])
-df['upper_wick'] = df['High'] - df[['Open','Close']].max(axis=1)
-df['lower_wick'] = df[['Open','Close']].min(axis=1) - df['Low']
-df['body_pct'] = df['body'] / df['range']
-
-# -----------------------------
-# CANDLE CLASSIFICATION
-# -----------------------------
-def classify_candle(row):
-    if row['range'] == 0:
-        return 0
-
-    neutral = (
-        row['body_pct'] <= 0.20 and
-        abs(row['upper_wick'] - row['lower_wick']) <= 0.20 * row['range']
-    )
-    if neutral:
-        return 0
-
-    body = row['Close'] - row['Open']
-    body_abs = abs(body)
-    upper = row['upper_wick']
-    lower = row['lower_wick']
-
-    if body > 0:
-        if body_abs / row['range'] >= 0.65: return 1
-        if lower >= 1.3 * body_abs: return 1
-        if body_abs / row['range'] >= 0.25: return 1
-        if upper > 1.5 * body_abs: return 0
-
-    if body < 0:
-        if body_abs / row['range'] >= 0.65: return -1
-        if upper >= 1.3 * body_abs: return -1
-        if body_abs / row['range'] >= 0.25: return -1
-        if lower > 1.5 * body_abs: return 0
-
-    return 0
-
-df['signal'] = df.apply(classify_candle, axis=1)
+scan_cache = {
+    "data": [],
+    "timestamp": 0
+}
 
 # -----------------------------
-# STREAK (FIXED LOGIC)
+# TODAY-BASED DATA WINDOW
 # -----------------------------
-price_change = df['Close'].diff()
-
-streak = []
-s = 0
-
-for d in price_change:
-    if d > 0:
-        s = s + 1 if s > 0 else 1
-    elif d < 0:
-        s = s - 1 if s < 0 else -1
-    else:
-        s = 0
-    streak.append(s)
-
-df['streak'] = streak
+def get_date_window(days_back):
+    end = datetime.now()
+    start = end - timedelta(days=days_back)
+    return start, end
 
 # -----------------------------
-# 3x3 PATTERNS
+# GRADIENT ENGINE
 # -----------------------------
-df['bullish_3x3'] = False
-df['bearish_3x3'] = False
+def compute_gradient(close_series, window=20):
+    close_series = close_series.dropna()
 
-for i in range(6, len(df)):
-    first = df.iloc[i-6:i-3]
-    second = df.iloc[i-3:i]
-    third = df.iloc[i-2:i+1]
+    if len(close_series) < window + 5:
+        return np.array([])
 
-    f_open, f_close = first['Open'].iloc[0], first['Close'].iloc[-1]
-    f_body = abs(f_close - f_open)
-    f_range = first['High'].max() - first['Low'].min()
+    streak = 0
+    codes = []
 
-    s_body = abs(second['Close'].iloc[-1] - second['Open'].iloc[0])
+    diffs = close_series.diff().fillna(0).values
 
-    t_open, t_close = third['Open'].iloc[0], third['Close'].iloc[-1]
-    t_body = abs(t_close - t_open)
-    t_range = third['High'].max() - third['Low'].min()
+    for d in diffs:
+        if d > 0:
+            streak = streak + 1 if streak >= 0 else 1
+        elif d < 0:
+            streak = streak - 1 if streak <= 0 else -1
+        else:
+            streak = 0
 
-    if (
-        f_close < f_open and
-        f_body >= 0.7 * f_range and
-        s_body <= 0.25 * f_body and
-        t_close > t_open and
-        t_body >= 0.7 * t_range
-    ):
-        df.at[df.index[i-1], 'bullish_3x3'] = True
+        codes.append(streak)
 
-    if (
-        f_close > f_open and
-        f_body >= 0.7 * f_range and
-        s_body <= 0.25 * f_body and
-        t_close < t_open and
-        t_body >= 0.7 * t_range
-    ):
-        df.at[df.index[i-1], 'bearish_3x3'] = True
+    codes = np.array(codes)
+
+    gradient = []
+    for i in range(len(codes)):
+        start = max(0, i - window + 1)
+        window_vals = codes[start:i+1]
+
+        score = (window_vals > 0).sum() - (window_vals < 0).sum()
+        gradient.append(score)
+
+    return np.array(gradient)
 
 # -----------------------------
-# ENGULFING (SIMPLIFIED BUT CORRECT)
+# SCANNER
 # -----------------------------
-df['bullish_engulf'] = False
-df['bearish_engulf'] = False
+def run_scan():
+    results = []
 
-N = 3
+    start_date, end_date = get_date_window(LOOKBACK_DAYS)
 
-for i in range(2*N, len(df)):
-    first = df.iloc[i-2*N:i-N]
-    second = df.iloc[i-N:i]
+    with open(ticker_file, "r") as f:
+        tickers = [t.strip().upper() for t in f if t.strip()]
 
-    f_open, f_close = first['Open'].iloc[0], first['Close'].iloc[-1]
-    s_open, s_close = second['Open'].iloc[0], second['Close'].iloc[-1]
+    for ticker in tickers:
+        try:
+            df = yf.download(
+                ticker,
+                start=start_date,
+                end=end_date,
+                auto_adjust=True,
+                progress=False
+            )
 
-    f_range = first['High'].max() - first['Low'].min()
-    s_range = second['High'].max() - second['Low'].min()
+            if df is None or df.empty:
+                continue
 
-    f_body = abs(f_close - f_open)
-    s_body = abs(s_close - s_open)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
 
-    # Bullish
-    if (
-        f_close < f_open and
-        s_close > s_open and
-        s_body > 0.5 * s_range and
-        s_open <= f_open and
-        s_close >= f_close
-    ):
-        df.loc[df.index[i-N:i], 'bullish_engulf'] = True
+            if "Close" not in df:
+                continue
 
-    # Bearish
-    if (
-        f_close > f_open and
-        s_close < s_open and
-        s_body > 0.5 * s_range and
-        s_open >= f_open and
-        s_close <= f_close
-    ):
-        df.loc[df.index[i-N:i], 'bearish_engulf'] = True
+            close = df["Close"].dropna()
 
-# -----------------------------
-# STRUCTURE SIGNAL (LIGHT WEIGHT)
-# -----------------------------
-df['structure_signal'] = 0
-df.loc[df['bullish_3x3'], 'structure_signal'] = 1
-df.loc[df['bearish_3x3'], 'structure_signal'] = -1
-df.loc[df['bullish_engulf'], 'structure_signal'] = 2
-df.loc[df['bearish_engulf'], 'structure_signal'] = -2
+            if len(close) < GRADIENT_WINDOW + 10:
+                continue
 
-# -----------------------------
-# NORMALIZED MOMENTUM
-# -----------------------------
-volatility = df['Close'].rolling(10).std()
-volatility = volatility.replace(0, np.nan)
+            grad = compute_gradient(close, GRADIENT_WINDOW)
 
-momentum = df['Close'].diff(3)
+            if grad is None or len(grad) == 0:
+                continue
 
-df['momentum_norm'] = (momentum / volatility).fillna(0)
+            score = float(grad[-1])
+
+            results.append({
+                "ticker": ticker,
+                "score": round(score, 2),
+                "signal": (
+                    "BULLISH" if score > 0 else
+                    "BEARISH" if score < 0 else
+                    "NEUTRAL"
+                )
+            })
+
+        except Exception as e:
+            print(f"[ERROR] {ticker}: {e}")
+            continue
+
+    return results
 
 # -----------------------------
-# GRADIENT SCORE (FINAL CLEAN VERSION)
+# BACKGROUND SCANNER LOOP
 # -----------------------------
-gradient_score = []
+def scanner_loop():
+    global scan_cache
 
-for i in range(len(df)):
-    start = max(0, i - gradient_window + 1)
+    while True:
+        try:
+            data = run_scan()
 
-    mom_window = df['momentum_norm'].iloc[start:i+1]
-    struct_window = df['structure_signal'].iloc[start:i+1]
+            if data and len(data) > 0:
+                scan_cache["data"] = data
+                scan_cache["timestamp"] = time.time()
+                print(f"Scan updated → {len(data)} tickers")
+            else:
+                print("Scan skipped (no valid data)")
 
-    momentum_score = np.tanh(mom_window.mean()) * 5
-    structure_score = struct_window.sum() * 0.5
+        except Exception as e:
+            print(f"Scanner error: {e}")
 
-    score = momentum_score + structure_score
-    score = np.clip(score, -5, 5)
-
-    gradient_score.append(score)
-
-df['gradient'] = gradient_score
+        time.sleep(SCAN_INTERVAL)
 
 # -----------------------------
-# VISUALIZATION (UNCHANGED STYLE)
+# API ROUTES
 # -----------------------------
-dates = df.index
+@app.get("/")
+def home():
+    return {"status": "running", "mode": "today_based"}
 
-fig, ax = plt.subplots(figsize=(16,8))
+@app.get("/scan")
+def scan():
+    return JSONResponse({
+        "results": scan_cache["data"],
+        "updated": scan_cache["timestamp"]
+    })
 
-cmap = LinearSegmentedColormap.from_list(
-    "trend",
-    ['#5b0000','#b30000','#ff6600','#ffd700','#bfff00','#66cc66','#006400']
-)
-norm = Normalize(vmin=-5, vmax=5)
-
-for i in range(len(df)-1):
-    color = cmap(norm(df['gradient'].iloc[i]))
-    ax.axvspan(dates[i], dates[i+1], color=color, alpha=0.6)
-
-ax.plot(dates, df['Close'], color='black', linewidth=2)
-
-ax.set_title("Gradient + Structure Momentum Indicator (Revised)")
-ax.grid(alpha=0.3)
-
-plt.show()
+# -----------------------------
+# START BACKGROUND THREAD
+# -----------------------------
+threading.Thread(target=scanner_loop, daemon=True).start()
