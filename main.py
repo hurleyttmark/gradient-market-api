@@ -1,364 +1,230 @@
-from fastapi import FastAPI, Query
+import pandas as pd
 import yfinance as yf
 import numpy as np
-import pandas as pd
-import traceback
-import time
-from threading import Thread
-from fastapi.responses import HTMLResponse
-
-app = FastAPI()
-
-# =============================
-# CORE SETTINGS
-# =============================
-GRADIENT_WINDOW = 10
-CACHE_TTL = 60  # seconds (LIVE UPDATE INTERVAL)
-
-# =============================
-# SIMPLE IN-MEMORY CACHE (MAKES IT "LIVE")
-# =============================
-cache = {}
-scan_cache = {
-    "data": None,
-    "timestamp": 0
-}
-
-# =============================
-# IMPROVED GRADIENT ENGINE (STABLE + HYBRID MOMENTUM)
-# =============================
-
-def compute_gradient(df):
-    df = df.copy()
-
-    # -----------------------------
-    # MOMENTUM (VOL NORMALIZED)
-    # -----------------------------
-    volatility = df['Close'].rolling(10).std()
-    volatility = volatility.replace(0, np.nan)
-
-    momentum = df['Close'].diff(3)
-    momentum_norm = (momentum / volatility).replace([np.inf, -np.inf], np.nan).fillna(0)
-
-    # -----------------------------
-    # STREAK (DIRECTIONAL PRESSURE)
-    # -----------------------------
-    price_change = df['Close'].diff()
-
-    streak = []
-    s = 0
-
-    for d in price_change:
-        if d > 0:
-            s = s + 1 if s > 0 else 1
-        elif d < 0:
-            s = s - 1 if s < 0 else -1
-        else:
-            s = 0
-        streak.append(s)
-
-    streak = np.array(streak)
-
-    # -----------------------------
-    # FINAL GRADIENT (STABLE HYBRID)
-    # -----------------------------
-    raw = np.tanh(momentum_norm) * 5 + np.tanh(streak / 5) * 2
-
-    raw = np.clip(raw, -5, 5)
-
-    return raw
-
-# =============================
-# LIVE CACHE HELPERS
-# =============================
-
-def get_cached(ticker):
-    if ticker in cache:
-        entry = cache[ticker]
-        if time.time() - entry["time"] < CACHE_TTL:
-            return entry["data"]
-    return None
-
-
-def set_cache(ticker, data):
-    cache[ticker] = {
-        "data": data,
-        "time": time.time()
-    }
-
-# =============================
-# TICKER ANALYZER (LIVE)
-# =============================
-@app.get("/analyze")
-def analyze(ticker: str = Query(...)):
-    try:
-        ticker = ticker.upper()
-
-        cached = get_cached(ticker)
-        if cached:
-            return cached
-
-        df = yf.download(ticker, period="3y", auto_adjust=True, progress=False)
-
-        if df is None or df.empty:
-            return {"error": "No data found"}
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        df = df[['Close']].dropna()
-
-        grad = compute_gradient(df)
-        latest_score = float(grad[-1])
-
-        result = {
-            "ticker": ticker,
-            "gradient_score": round(latest_score, 3),
-            "signal": "bullish" if latest_score > 1 else "bearish" if latest_score < -1 else "neutral",
-            "data_points": len(df),
-            "cached": False
-        }
-
-        set_cache(ticker, result)
-        return result
-
-    except Exception as e:
-        return {
-            "error": "Server error",
-            "details": str(e),
-            "trace": traceback.format_exc()
-        }
-
-# =============================
-# BACKGROUND LIVE SCANNER
-# =============================
-
-def update_scan_loop():
-    tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL"]
-
-    while True:
-        results = []
-
-        for t in tickers:
-            try:
-                df = yf.download(t, period="1y", auto_adjust=True, progress=False)
-
-                if df is None or df.empty:
-                    continue
-
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-
-                df = df[['Close']].dropna()
-                grad = compute_gradient(df)
-
-                results.append({
-                    "ticker": t,
-                    "score": round(float(grad[-1]), 3),
-                    "signal": "bullish" if grad[-1] > 1 else "bearish" if grad[-1] < -1 else "neutral"
-                })
-
-            except:
-                continue
-
-        scan_cache["data"] = sorted(results, key=lambda x: x["score"], reverse=True)
-        scan_cache["timestamp"] = time.time()
-
-        time.sleep(CACHE_TTL)
-
-Thread(target=update_scan_loop, daemon=True).start()
-
-# =============================
-# LIVE SCANNER ENDPOINT
-# =============================
-@app.get("/scan")
-def scan():
-    return {
-        "live": True,
-        "last_updated": scan_cache["timestamp"],
-        "results": scan_cache["data"]
-    }
-
-# =============================
-# DASHBOARD
-# =============================
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    html = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Gradient Heat Dashboard</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1"/>
-
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-
-        html, body {
-            margin: 0;
-            padding: 0;
-            width: 100%;
-            background: radial-gradient(circle at top, #0f1a2b, #0b1220);
-            color: #ffffff;
-            font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, Arial;
-            overflow-x: hidden;
-            text-align: center;
-        }
-
-        .container {
-            width: 100%;
-            max-width: 1100px;
-            margin: 0 auto;
-            padding: 80px 20px;
-        }
-
-        h1 {
-            font-size: 42px;
-            margin-bottom: 10px;
-            font-weight: 700;
-        }
-
-        .subtitle {
-            color: #9aa4b2;
-            margin: 0 auto 30px auto;
-            font-size: 16px;
-            line-height: 1.6;
-            max-width: 750px;
-        }
-
-        .input-row {
-            display: flex;
-            justify-content: center;
-            gap: 12px;
-            margin-bottom: 35px;
-            flex-wrap: wrap;
-        }
-
-        input {
-            padding: 14px 16px;
-            font-size: 16px;
-            border-radius: 12px;
-            border: 1px solid #263244;
-            background: #0f1a2b;
-            color: white;
-            width: 260px;
-            text-align: center;
-            outline: none;
-        }
-
-        button {
-            padding: 14px 20px;
-            font-size: 16px;
-            border-radius: 12px;
-            border: none;
-            background: linear-gradient(135deg, #22c55e, #16a34a);
-            color: black;
-            font-weight: 700;
-            cursor: pointer;
-        }
-
-        .card {
-            margin: 0 auto 40px auto;
-            padding: 34px;
-            background: #111c2e;
-            border-radius: 16px;
-            max-width: 320px;
-            box-shadow: 0 12px 40px rgba(0,0,0,0.55);
-        }
-
-        #symbol { font-size: 20px; color: #cbd5e1; }
-        #score { font-size: 56px; font-weight: 700; }
-        #signal { font-size: 16px; color: #9aa4b2; }
-
-        table {
-            margin: 30px auto;
-            width: 100%;
-            max-width: 900px;
-            border-collapse: collapse;
-            background: #0f1a2b;
-        }
-
-        th, td {
-            padding: 14px;
-            border-bottom: 1px solid #1f2a3a;
-        }
-
-        th { color: #cbd5e1; }
-        td { color: #e2e8f0; }
-    </style>
-</head>
-<body>
-
-<div class="container">
-
-    <h1>🔥 Gradient Heat Dashboard</h1>
-
-    <div class="subtitle">
-        Real-time momentum + structure scoring system measuring trend strength and reversal pressure.
-    </div>
-
-    <div class="input-row">
-        <input id="ticker" placeholder="Enter ticker (AAPL)" />
-        <button onclick="analyze()">Analyze</button>
-    </div>
-
-    <div class="card">
-        <div id="symbol">---</div>
-        <div id="score">0</div>
-        <div id="signal">---</div>
-    </div>
-
-    <button onclick="loadScan()">Refresh Scan</button>
-
-    <table id="table"></table>
-
-</div>
-
-<script>
-const API = window.location.origin;
-
-async function analyze() {
-    const t = document.getElementById('ticker').value;
-    const res = await fetch(`${API}/analyze?ticker=${t}`);
-    const data = await res.json();
-
-    document.getElementById('symbol').innerText = data.ticker;
-    document.getElementById('score').innerText = data.gradient_score;
-    document.getElementById('signal').innerText = data.signal;
-}
-
-async function loadScan() {
-    const res = await fetch(`${API}/scan`);
-    const data = await res.json();
-
-    let html = '<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>';
-
-    (data.results || []).forEach(r => {
-        html += `<tr><td>${r.ticker}</td><td>${r.score}</td><td>${r.signal}</td></tr>`;
-    });
-
-    document.getElementById('table').innerHTML = html;
-}
-
-loadScan();
-setInterval(loadScan, 15000);
-</script>
-
-</body>
-</html>
-"""
-    return HTMLResponse(content=html)
-
-# =============================
-# ROOT
-# =============================
-@app.get("/")
-def root():
-    return {
-        "message": "LIVE Gradient Heat API running",
-        "dashboard": "/dashboard",
-        "endpoints": {
-            "/analyze?ticker=AAPL": "live cached gradient score",
-            "/scan": "live market heatmap"
-        }
-    }
+import matplotlib.pyplot as plt
+from datetime import datetime
+from matplotlib.colors import LinearSegmentedColormap, Normalize
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+symbol = "gddy"
+start_date = datetime(2021,1,13)
+end_date   = datetime(2023,1,17)
+
+gradient_window = 20
+
+# -----------------------------
+# DOWNLOAD DATA
+# -----------------------------
+df = yf.download(symbol, start=start_date, end=end_date,
+                 auto_adjust=True, progress=False)
+
+df = df[['Open','High','Low','Close','Volume']].dropna()
+
+# -----------------------------
+# CANDLE METRICS
+# -----------------------------
+df['range'] = df['High'] - df['Low']
+df['body'] = abs(df['Close'] - df['Open'])
+df['upper_wick'] = df['High'] - df[['Open','Close']].max(axis=1)
+df['lower_wick'] = df[['Open','Close']].min(axis=1) - df['Low']
+df['body_pct'] = df['body'] / df['range']
+
+# -----------------------------
+# CANDLE CLASSIFICATION
+# -----------------------------
+def classify_candle(row):
+    if row['range'] == 0:
+        return 0
+
+    neutral = (
+        row['body_pct'] <= 0.20 and
+        abs(row['upper_wick'] - row['lower_wick']) <= 0.20 * row['range']
+    )
+    if neutral:
+        return 0
+
+    body = row['Close'] - row['Open']
+    body_abs = abs(body)
+    upper = row['upper_wick']
+    lower = row['lower_wick']
+
+    if body > 0:
+        if body_abs / row['range'] >= 0.65: return 1
+        if lower >= 1.3 * body_abs: return 1
+        if body_abs / row['range'] >= 0.25: return 1
+        if upper > 1.5 * body_abs: return 0
+
+    if body < 0:
+        if body_abs / row['range'] >= 0.65: return -1
+        if upper >= 1.3 * body_abs: return -1
+        if body_abs / row['range'] >= 0.25: return -1
+        if lower > 1.5 * body_abs: return 0
+
+    return 0
+
+df['signal'] = df.apply(classify_candle, axis=1)
+
+# -----------------------------
+# STREAK (FIXED LOGIC)
+# -----------------------------
+price_change = df['Close'].diff()
+
+streak = []
+s = 0
+
+for d in price_change:
+    if d > 0:
+        s = s + 1 if s > 0 else 1
+    elif d < 0:
+        s = s - 1 if s < 0 else -1
+    else:
+        s = 0
+    streak.append(s)
+
+df['streak'] = streak
+
+# -----------------------------
+# 3x3 PATTERNS
+# -----------------------------
+df['bullish_3x3'] = False
+df['bearish_3x3'] = False
+
+for i in range(6, len(df)):
+    first = df.iloc[i-6:i-3]
+    second = df.iloc[i-3:i]
+    third = df.iloc[i-2:i+1]
+
+    f_open, f_close = first['Open'].iloc[0], first['Close'].iloc[-1]
+    f_body = abs(f_close - f_open)
+    f_range = first['High'].max() - first['Low'].min()
+
+    s_body = abs(second['Close'].iloc[-1] - second['Open'].iloc[0])
+
+    t_open, t_close = third['Open'].iloc[0], third['Close'].iloc[-1]
+    t_body = abs(t_close - t_open)
+    t_range = third['High'].max() - third['Low'].min()
+
+    if (
+        f_close < f_open and
+        f_body >= 0.7 * f_range and
+        s_body <= 0.25 * f_body and
+        t_close > t_open and
+        t_body >= 0.7 * t_range
+    ):
+        df.at[df.index[i-1], 'bullish_3x3'] = True
+
+    if (
+        f_close > f_open and
+        f_body >= 0.7 * f_range and
+        s_body <= 0.25 * f_body and
+        t_close < t_open and
+        t_body >= 0.7 * t_range
+    ):
+        df.at[df.index[i-1], 'bearish_3x3'] = True
+
+# -----------------------------
+# ENGULFING (SIMPLIFIED BUT CORRECT)
+# -----------------------------
+df['bullish_engulf'] = False
+df['bearish_engulf'] = False
+
+N = 3
+
+for i in range(2*N, len(df)):
+    first = df.iloc[i-2*N:i-N]
+    second = df.iloc[i-N:i]
+
+    f_open, f_close = first['Open'].iloc[0], first['Close'].iloc[-1]
+    s_open, s_close = second['Open'].iloc[0], second['Close'].iloc[-1]
+
+    f_range = first['High'].max() - first['Low'].min()
+    s_range = second['High'].max() - second['Low'].min()
+
+    f_body = abs(f_close - f_open)
+    s_body = abs(s_close - s_open)
+
+    # Bullish
+    if (
+        f_close < f_open and
+        s_close > s_open and
+        s_body > 0.5 * s_range and
+        s_open <= f_open and
+        s_close >= f_close
+    ):
+        df.loc[df.index[i-N:i], 'bullish_engulf'] = True
+
+    # Bearish
+    if (
+        f_close > f_open and
+        s_close < s_open and
+        s_body > 0.5 * s_range and
+        s_open >= f_open and
+        s_close <= f_close
+    ):
+        df.loc[df.index[i-N:i], 'bearish_engulf'] = True
+
+# -----------------------------
+# STRUCTURE SIGNAL (LIGHT WEIGHT)
+# -----------------------------
+df['structure_signal'] = 0
+df.loc[df['bullish_3x3'], 'structure_signal'] = 1
+df.loc[df['bearish_3x3'], 'structure_signal'] = -1
+df.loc[df['bullish_engulf'], 'structure_signal'] = 2
+df.loc[df['bearish_engulf'], 'structure_signal'] = -2
+
+# -----------------------------
+# NORMALIZED MOMENTUM
+# -----------------------------
+volatility = df['Close'].rolling(10).std()
+volatility = volatility.replace(0, np.nan)
+
+momentum = df['Close'].diff(3)
+
+df['momentum_norm'] = (momentum / volatility).fillna(0)
+
+# -----------------------------
+# GRADIENT SCORE (FINAL CLEAN VERSION)
+# -----------------------------
+gradient_score = []
+
+for i in range(len(df)):
+    start = max(0, i - gradient_window + 1)
+
+    mom_window = df['momentum_norm'].iloc[start:i+1]
+    struct_window = df['structure_signal'].iloc[start:i+1]
+
+    momentum_score = np.tanh(mom_window.mean()) * 5
+    structure_score = struct_window.sum() * 0.5
+
+    score = momentum_score + structure_score
+    score = np.clip(score, -5, 5)
+
+    gradient_score.append(score)
+
+df['gradient'] = gradient_score
+
+# -----------------------------
+# VISUALIZATION (UNCHANGED STYLE)
+# -----------------------------
+dates = df.index
+
+fig, ax = plt.subplots(figsize=(16,8))
+
+cmap = LinearSegmentedColormap.from_list(
+    "trend",
+    ['#5b0000','#b30000','#ff6600','#ffd700','#bfff00','#66cc66','#006400']
+)
+norm = Normalize(vmin=-5, vmax=5)
+
+for i in range(len(df)-1):
+    color = cmap(norm(df['gradient'].iloc[i]))
+    ax.axvspan(dates[i], dates[i+1], color=color, alpha=0.6)
+
+ax.plot(dates, df['Close'], color='black', linewidth=2)
+
+ax.set_title("Gradient + Structure Momentum Indicator (Revised)")
+ax.grid(alpha=0.3)
+
+plt.show()
