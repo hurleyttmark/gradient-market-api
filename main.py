@@ -15,121 +15,74 @@ app = FastAPI()
 CACHE_TTL = 60
 
 cache = {}
-scan_cache = {
-    "data": None,
-    "timestamp": 0
-}
+scan_cache = {"data": [], "timestamp": 0}
 
 # =============================
 # CACHE
 # =============================
 def get_cached(ticker):
     if ticker in cache:
-        entry = cache[ticker]
-        if time.time() - entry["time"] < CACHE_TTL:
-            return entry["data"]
+        if time.time() - cache[ticker]["time"] < CACHE_TTL:
+            return cache[ticker]["data"]
     return None
-
 
 def set_cache(ticker, data):
     cache[ticker] = {"data": data, "time": time.time()}
 
-
 # =============================
-# DATA LOADER (SAFE)
-# =============================
-def load_data(ticker):
-    df = yf.download(ticker, period="3y", auto_adjust=True, progress=False)
-
-    if df is None or df.empty:
-        return None
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-
-    return df
-
-
-# =============================
-# GRADIENT ENGINE (YOUR ORIGINAL + SAFE 3-DAY ADDITION)
+# GRADIENT ENGINE (CORRECTED + LONG TERM LOGIC)
 # =============================
 def compute_gradient(df):
     df = df.copy()
 
-    # =============================
-    # BASE MOMENTUM SYSTEM (UNCHANGED)
-    # =============================
-    df['returns'] = df['Close'].pct_change()
-    df['vol'] = df['returns'].rolling(10).std()
+    # -----------------------------
+    # RETURNS + VOL NORMALIZATION
+    # -----------------------------
+    df["returns"] = df["Close"].pct_change()
+    df["vol"] = df["returns"].rolling(10).std()
+    df["vol"] = df["vol"].replace(0, np.nan)
 
-    df['vol'] = df['vol'].replace(0, np.nan)
-    df['momentum'] = df['returns'] / df['vol']
-    df['momentum'] = df['momentum'].replace([np.inf, -np.inf], np.nan).fillna(0)
+    df["momentum"] = (df["returns"] / df["vol"]).replace([np.inf, -np.inf], 0).fillna(0)
 
-    df['trend'] = df['momentum'].rolling(5).mean().fillna(0)
-    df['accel'] = df['momentum'].diff().fillna(0)
+    # -----------------------------
+    # TREND + ACCELERATION
+    # -----------------------------
+    df["trend"] = df["momentum"].rolling(5).mean().fillna(0)
+    df["accel"] = df["momentum"].diff().fillna(0)
 
-    if 'Volume' in df.columns:
-        df['vol_ma'] = df['Volume'].rolling(10).mean()
-        df['vol_boost'] = np.where(df['Volume'] > df['vol_ma'], 1, 0)
+    # -----------------------------
+    # VOLUME CONFIRMATION
+    # -----------------------------
+    if "Volume" in df.columns:
+        vol_ma = df["Volume"].rolling(10).mean()
+        df["vol_boost"] = (df["Volume"] > vol_ma).astype(int)
     else:
-        df['vol_boost'] = 0
+        df["vol_boost"] = 0
 
-    base = (
-        0.6 * df['trend'] +
-        0.3 * df['accel'] +
-        0.1 * df['vol_boost']
+    # -----------------------------
+    # CANDLE MOMENTUM STRUCTURE (LONG TERM CORE)
+    # -----------------------------
+    if "Open" in df.columns:
+
+        df["range"] = df["High"] - df["Low"]
+        df["body"] = (df["Close"] - df["Open"]).abs()
+
+        df["bull_strength"] = np.where(df["Close"] > df["Open"], 1, 0)
+        df["bear_strength"] = np.where(df["Close"] < df["Open"], -1, 0)
+
+        df["candle_pressure"] = (df["bull_strength"] + df["bear_strength"]).rolling(3).sum().fillna(0)
+    else:
+        df["candle_pressure"] = 0
+
+    # -----------------------------
+    # FINAL RAW SCORE
+    # -----------------------------
+    raw = (
+        0.5 * df["trend"] +
+        0.3 * df["accel"] +
+        0.1 * df["vol_boost"] +
+        0.1 * df["candle_pressure"]
     )
-
-    # =============================
-    # SAFE 3-DAY STRUCTURE LAYER
-    # =============================
-    N = 3
-    structure = np.zeros(len(df))
-
-    for i in range(2 * N, len(df)):
-
-        first = df.iloc[i-2*N:i-N]
-        second = df.iloc[i-N:i]
-
-        # safety check (prevents crash)
-        if len(first) < 1 or len(second) < 1:
-            continue
-
-        # FIRST BLOCK (3-day group)
-        f_open = first['Open'].iloc[0]
-        f_close = first['Close'].iloc[-1]
-
-        # SECOND BLOCK (next 3-day group)
-        s_open = second['Open'].iloc[0]
-        s_close = second['Close'].iloc[-1]
-
-        f_body = abs(f_close - f_open)
-        s_body = abs(s_close - s_open)
-
-        # =============================
-        # 3-DAY TREND SHIFT
-        # =============================
-        if f_close < f_open and s_close > s_open:
-            structure[i] += 1
-
-        if f_close > f_open and s_close < s_open:
-            structure[i] -= 1
-
-        # =============================
-        # BREAKOUT EXPANSION
-        # =============================
-        if s_body > (f_body * 1.2):
-            structure[i] += np.sign(s_close - s_open)
-
-    # =============================
-    # FINAL SCORE (SAFE COMBINATION)
-    # =============================
-    raw = base + 0.7 * structure
-
-    raw = np.nan_to_num(raw)
 
     return np.tanh(raw) * 5
 
@@ -146,53 +99,59 @@ def analyze(ticker: str = Query(...)):
         if cached:
             return cached
 
-        df = load_data(ticker)
-        if df is None:
-            return {"error": "No data found"}
+        df = yf.download(ticker, period="3y", auto_adjust=True, progress=False)
+
+        if df is None or df.empty:
+            return {"error": "No data"}
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df = df.dropna()
 
         grad = compute_gradient(df)
-        latest = float(grad[-1])
+        score = float(grad[-1])
 
         result = {
             "ticker": ticker,
-            "gradient_score": round(latest, 3),
-            "signal": "bullish" if latest > 1 else "bearish" if latest < -1 else "neutral",
-            "data_points": len(df),
-            "cached": False
+            "gradient_score": round(score, 3),
+            "signal": "bullish" if score > 1 else "bearish" if score < -1 else "neutral"
         }
 
         set_cache(ticker, result)
         return result
 
     except Exception as e:
-        return {
-            "error": "Server error",
-            "details": str(e),
-            "trace": traceback.format_exc()
-        }
+        return {"error": str(e), "trace": traceback.format_exc()}
 
 
 # =============================
-# SCANNER
+# LIVE SCANNER
 # =============================
-def update_scan_loop():
-    tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL"]
+def scanner_loop():
+    tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"]
 
     while True:
         results = []
 
         for t in tickers:
             try:
-                df = load_data(t)
-                if df is None:
+                df = yf.download(t, period="1y", auto_adjust=True, progress=False)
+
+                if df is None or df.empty:
                     continue
 
-                grad = compute_gradient(df)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+
+                df = df.dropna()
+
+                score = float(compute_gradient(df)[-1])
 
                 results.append({
                     "ticker": t,
-                    "score": round(float(grad[-1]), 3),
-                    "signal": "bullish" if grad[-1] > 1 else "bearish" if grad[-1] < -1 else "neutral"
+                    "score": round(score, 3),
+                    "signal": "bullish" if score > 1 else "bearish" if score < -1 else "neutral"
                 })
 
             except:
@@ -203,82 +162,88 @@ def update_scan_loop():
 
         time.sleep(CACHE_TTL)
 
-
-Thread(target=update_scan_loop, daemon=True).start()
-
-
-@app.get("/scan")
-def scan():
-    return scan_cache
+Thread(target=scanner_loop, daemon=True).start()
 
 
 # =============================
-# DASHBOARD
+# SCAN ENDPOINT
+# =============================
+@app.get("/scan")
+def scan():
+    return {
+        "live": True,
+        "last_updated": scan_cache["timestamp"],
+        "data": scan_cache["data"]   # ✅ FIXED KEY (THIS WAS YOUR BUG)
+    }
+
+
+# =============================
+# DASHBOARD (CLEAN + COMPACT)
 # =============================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    html = """
+    return HTMLResponse("""
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Gradient Dashboard</title>
-    <style>
-        body { background:#0f172a; color:white; font-family:Arial; text-align:center; }
-        input, button { padding:10px; margin:5px; }
-        .card { background:#1e293b; padding:20px; border-radius:10px; display:inline-block; margin:20px; }
-        table { margin:auto; border-collapse:collapse; }
-        td,th { padding:10px 20px; border-bottom:1px solid #334155; }
-    </style>
+<title>Gradient Dashboard</title>
+<style>
+body{background:#0b1220;color:white;font-family:Arial;text-align:center}
+.card{background:#111c2e;padding:20px;margin:20px auto;width:260px;border-radius:12px}
+input,button{padding:10px;margin:5px}
+table{margin:auto;width:80%;border-collapse:collapse}
+td,th{padding:10px;border-bottom:1px solid #2a3b55}
+</style>
 </head>
+
 <body>
 
-<h1>🔥 Gradient Heat Dashboard</h1>
+<h2>🔥 Gradient Dashboard</h2>
 
-<input id="ticker" placeholder="Enter ticker (AAPL)" />
+<input id="ticker" placeholder="AAPL">
 <button onclick="run()">Analyze</button>
 
 <div class="card">
-    <h2 id="sym">---</h2>
-    <h1 id="score">0</h1>
-    <div id="signal">---</div>
+<h3 id="t">---</h3>
+<h1 id="s">0</h1>
+<div id="sig">---</div>
 </div>
 
-<h3>Live Scanner</h3>
-<button onclick="scan()">Refresh</button>
-<table id="table"></table>
+<button onclick="load()">Refresh Scan</button>
+
+<table id="tbl"></table>
 
 <script>
 async function run(){
-    const t = document.getElementById("ticker").value;
-    const r = await fetch("/analyze?ticker="+t);
-    const d = await r.json();
+ const t=document.getElementById("ticker").value;
+ const r=await fetch("/analyze?ticker="+t);
+ const d=await r.json();
 
-    document.getElementById("sym").innerText = d.ticker;
-    document.getElementById("score").innerText = d.gradient_score;
-    document.getElementById("signal").innerText = d.signal;
+ document.getElementById("t").innerText=d.ticker;
+ document.getElementById("s").innerText=d.gradient_score;
+ document.getElementById("sig").innerText=d.signal;
 }
 
-async function scan(){
-    const r = await fetch("/scan");
-    const d = await r.json();
+async function load(){
+ const r=await fetch("/scan");
+ const d=await r.json();
 
-    let h = "<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
+ let h="<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
 
-    d.results.forEach(x=>{
-        h += `<tr><td>${x.ticker}</td><td>${x.score}</td><td>${x.signal}</td></tr>`;
-    });
+ (d.data||[]).forEach(x=>{
+   h+=`<tr><td>${x.ticker}</td><td>${x.score}</td><td>${x.signal}</td></tr>`;
+ });
 
-    document.getElementById("table").innerHTML = h;
+ document.getElementById("tbl").innerHTML=h;
 }
 
-scan();
-setInterval(scan, 15000);
+load();
+setInterval(load,10000);
 </script>
 
 </body>
 </html>
-"""
-    return HTMLResponse(content=html)
+""")
 
 
 # =============================
