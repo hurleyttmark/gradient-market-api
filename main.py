@@ -2,8 +2,8 @@ from fastapi import FastAPI, Query
 import yfinance as yf
 import numpy as np
 import pandas as pd
-import traceback
 import time
+import traceback
 from threading import Thread
 from fastapi.responses import HTMLResponse
 
@@ -14,18 +14,14 @@ app = FastAPI()
 # =============================
 CACHE_TTL = 60
 
-# =============================
-# SAFE STORAGE (NEVER None)
-# =============================
 cache = {}
-
 scan_cache = {
-    "data": [],   # 🔥 CRITICAL FIX (never None)
+    "data": [],
     "timestamp": 0
 }
 
 # =============================
-# CACHE HELPERS
+# CACHE
 # =============================
 def get_cached(ticker):
     if ticker in cache:
@@ -35,31 +31,25 @@ def get_cached(ticker):
 
 
 def set_cache(ticker, data):
-    cache[ticker] = {
-        "data": data,
-        "time": time.time()
-    }
+    cache[ticker] = {"data": data, "time": time.time()}
 
 # =============================
-# GRADIENT ENGINE (STABLE + LONG TERM LOGIC)
+# CORE GRADIENT ENGINE (YOUR ORIGINAL BASE + SAFE UPGRADE)
 # =============================
 def compute_gradient(df):
     df = df.copy()
 
     # -------------------------
-    # CORE MOMENTUM
+    # BASE MOMENTUM SYSTEM (UNCHANGED CORE)
     # -------------------------
-    df["returns"] = df["Close"].pct_change()
-    df["vol"] = df["returns"].rolling(10).std()
-    df["vol"] = df["vol"].replace(0, np.nan)
+    df['returns'] = df['Close'].pct_change()
+    df['vol'] = df['returns'].rolling(10).std()
+    df['vol'] = df['vol'].replace(0, np.nan)
 
-    df["momentum"] = (df["returns"] / df["vol"]).replace([np.inf, -np.inf], 0).fillna(0)
+    df['momentum'] = (df['returns'] / df['vol']).replace([np.inf, -np.inf], 0).fillna(0)
 
-    # -------------------------
-    # TREND + ACCEL
-    # -------------------------
-    df["trend"] = df["momentum"].rolling(5).mean().fillna(0)
-    df["accel"] = df["momentum"].diff().fillna(0)
+    df['trend'] = df['momentum'].rolling(5).mean().fillna(0)
+    df['accel'] = df['momentum'].diff().fillna(0)
 
     # -------------------------
     # VOLUME CONFIRMATION
@@ -71,26 +61,38 @@ def compute_gradient(df):
         df["vol_boost"] = 0
 
     # -------------------------
-    # CANDLE STRUCTURE (3-day pressure proxy)
+    # SAFE 3-DAY CANDLE PRESSURE (NO LOOPS, NO BREAKS)
     # -------------------------
-    df["candle_dir"] = np.sign(df["Close"] - df["Open"]) if "Open" in df.columns else 0
-    df["candle_pressure"] = df["candle_dir"].rolling(3).sum().fillna(0)
+    if "Open" in df.columns:
+        body = (df["Close"] - df["Open"]).abs()
+        rng = (df["High"] - df["Low"]).replace(0, np.nan)
+
+        body_ratio = (body / rng).fillna(0)
+
+        # bullish/bearish pressure
+        direction = np.sign(df["Close"] - df["Open"])
+
+        df["candle_pressure"] = (
+            direction.rolling(3).sum().fillna(0) / 3
+        )
+    else:
+        df["candle_pressure"] = 0
 
     # -------------------------
-    # FINAL SCORE (ROBUST VERSION)
+    # FINAL SCORE (STABLE HYBRID)
     # -------------------------
     raw = (
-        0.5 * df["trend"] +
-        0.3 * df["accel"] +
-        0.1 * df["vol_boost"] +
-        0.1 * df["candle_pressure"]
+        0.55 * df['trend'] +
+        0.25 * df['accel'] +
+        0.10 * df['vol_boost'] +
+        0.10 * df['candle_pressure']
     )
 
     return np.tanh(raw) * 5
 
 
 # =============================
-# ANALYZE ENDPOINT
+# ANALYZE
 # =============================
 @app.get("/analyze")
 def analyze(ticker: str = Query(...)):
@@ -104,7 +106,7 @@ def analyze(ticker: str = Query(...)):
         df = yf.download(ticker, period="3y", auto_adjust=True, progress=False)
 
         if df is None or df.empty:
-            return {"error": "No data"}
+            return {"error": "no data"}
 
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -117,22 +119,18 @@ def analyze(ticker: str = Query(...)):
         result = {
             "ticker": ticker,
             "gradient_score": round(score, 3),
-            "signal": "bullish" if score > 1 else "bearish" if score < -1 else "neutral",
-            "ok": True
+            "signal": "bullish" if score > 1 else "bearish" if score < -1 else "neutral"
         }
 
         set_cache(ticker, result)
         return result
 
     except Exception as e:
-        return {
-            "error": str(e),
-            "trace": traceback.format_exc()
-        }
+        return {"error": str(e), "trace": traceback.format_exc()}
 
 
 # =============================
-# LIVE SCANNER LOOP
+# SCANNER LOOP (STABLE)
 # =============================
 def scanner_loop():
     tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"]
@@ -160,11 +158,10 @@ def scanner_loop():
                     "signal": "bullish" if score > 1 else "bearish" if score < -1 else "neutral"
                 })
 
-            except Exception as e:
-                print("scan error:", t, e)
+            except:
+                continue
 
-        # 🔥 GUARANTEED STRUCTURE
-        scan_cache["data"] = results if results else []
+        scan_cache["data"] = results
         scan_cache["timestamp"] = time.time()
 
         time.sleep(CACHE_TTL)
@@ -181,12 +178,12 @@ def scan():
     return {
         "live": True,
         "last_updated": scan_cache["timestamp"],
-        "data": scan_cache.get("data", [])   # 🔥 SAFE ALWAYS
+        "data": scan_cache.get("data", [])
     }
 
 
 # =============================
-# DASHBOARD (CLEAN + ERROR PROOF)
+# DASHBOARD (CLEAN + SAFE)
 # =============================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -197,33 +194,30 @@ def dashboard():
 <title>Gradient Dashboard</title>
 
 <style>
-body{
+body {
     background:#0b1220;
     color:white;
     font-family:Arial;
     text-align:center;
 }
 
-.card{
+.card {
     background:#111c2e;
     padding:20px;
-    margin:20px auto;
     width:260px;
+    margin:20px auto;
     border-radius:12px;
 }
 
-input,button{
-    padding:10px;
-    margin:5px;
-}
+input,button { padding:10px; margin:5px; }
 
-table{
+table {
     margin:auto;
     width:80%;
     border-collapse:collapse;
 }
 
-td,th{
+td,th {
     padding:10px;
     border-bottom:1px solid #2a3b55;
 }
@@ -233,7 +227,7 @@ td,th{
 
 <body>
 
-<h2>🔥 Gradient Dashboard</h2>
+<h2>🔥 Gradient Heat Dashboard</h2>
 
 <input id="ticker" placeholder="AAPL">
 <button onclick="run()">Analyze</button>
@@ -256,16 +250,16 @@ async function run(){
     const r=await fetch("/analyze?ticker="+t);
     const d=await r.json();
 
-    document.getElementById("t").innerText = d.ticker || "---";
-    document.getElementById("s").innerText = d.gradient_score ?? 0;
-    document.getElementById("sig").innerText = d.signal || "---";
+    document.getElementById("t").innerText=d.ticker||"---";
+    document.getElementById("s").innerText=d.gradient_score??0;
+    document.getElementById("sig").innerText=d.signal||"---";
 }
 
 async function load(){
     const r=await fetch("/scan");
     const d=await r.json();
 
-    const rows = d?.data ?? [];   // 🔥 NO MORE UNDEFINED
+    const rows = d?.data ?? [];
 
     let h="<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
 
@@ -277,11 +271,11 @@ async function load(){
               </tr>`;
     });
 
-    document.getElementById("tbl").innerHTML = h;
+    document.getElementById("tbl").innerHTML=h;
 }
 
 load();
-setInterval(load, 10000);
+setInterval(load,10000);
 
 </script>
 
