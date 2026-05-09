@@ -14,11 +14,18 @@ app = FastAPI()
 # =============================
 CACHE_TTL = 60
 
+# =============================
+# SAFE STORAGE (NEVER None)
+# =============================
 cache = {}
-scan_cache = {"data": [], "timestamp": 0}
+
+scan_cache = {
+    "data": [],   # 🔥 CRITICAL FIX (never None)
+    "timestamp": 0
+}
 
 # =============================
-# CACHE
+# CACHE HELPERS
 # =============================
 def get_cached(ticker):
     if ticker in cache:
@@ -26,57 +33,52 @@ def get_cached(ticker):
             return cache[ticker]["data"]
     return None
 
+
 def set_cache(ticker, data):
-    cache[ticker] = {"data": data, "time": time.time()}
+    cache[ticker] = {
+        "data": data,
+        "time": time.time()
+    }
 
 # =============================
-# GRADIENT ENGINE (CORRECTED + LONG TERM LOGIC)
+# GRADIENT ENGINE (STABLE + LONG TERM LOGIC)
 # =============================
 def compute_gradient(df):
     df = df.copy()
 
-    # -----------------------------
-    # RETURNS + VOL NORMALIZATION
-    # -----------------------------
+    # -------------------------
+    # CORE MOMENTUM
+    # -------------------------
     df["returns"] = df["Close"].pct_change()
     df["vol"] = df["returns"].rolling(10).std()
     df["vol"] = df["vol"].replace(0, np.nan)
 
     df["momentum"] = (df["returns"] / df["vol"]).replace([np.inf, -np.inf], 0).fillna(0)
 
-    # -----------------------------
-    # TREND + ACCELERATION
-    # -----------------------------
+    # -------------------------
+    # TREND + ACCEL
+    # -------------------------
     df["trend"] = df["momentum"].rolling(5).mean().fillna(0)
     df["accel"] = df["momentum"].diff().fillna(0)
 
-    # -----------------------------
+    # -------------------------
     # VOLUME CONFIRMATION
-    # -----------------------------
+    # -------------------------
     if "Volume" in df.columns:
         vol_ma = df["Volume"].rolling(10).mean()
         df["vol_boost"] = (df["Volume"] > vol_ma).astype(int)
     else:
         df["vol_boost"] = 0
 
-    # -----------------------------
-    # CANDLE MOMENTUM STRUCTURE (LONG TERM CORE)
-    # -----------------------------
-    if "Open" in df.columns:
+    # -------------------------
+    # CANDLE STRUCTURE (3-day pressure proxy)
+    # -------------------------
+    df["candle_dir"] = np.sign(df["Close"] - df["Open"]) if "Open" in df.columns else 0
+    df["candle_pressure"] = df["candle_dir"].rolling(3).sum().fillna(0)
 
-        df["range"] = df["High"] - df["Low"]
-        df["body"] = (df["Close"] - df["Open"]).abs()
-
-        df["bull_strength"] = np.where(df["Close"] > df["Open"], 1, 0)
-        df["bear_strength"] = np.where(df["Close"] < df["Open"], -1, 0)
-
-        df["candle_pressure"] = (df["bull_strength"] + df["bear_strength"]).rolling(3).sum().fillna(0)
-    else:
-        df["candle_pressure"] = 0
-
-    # -----------------------------
-    # FINAL RAW SCORE
-    # -----------------------------
+    # -------------------------
+    # FINAL SCORE (ROBUST VERSION)
+    # -------------------------
     raw = (
         0.5 * df["trend"] +
         0.3 * df["accel"] +
@@ -115,18 +117,22 @@ def analyze(ticker: str = Query(...)):
         result = {
             "ticker": ticker,
             "gradient_score": round(score, 3),
-            "signal": "bullish" if score > 1 else "bearish" if score < -1 else "neutral"
+            "signal": "bullish" if score > 1 else "bearish" if score < -1 else "neutral",
+            "ok": True
         }
 
         set_cache(ticker, result)
         return result
 
     except Exception as e:
-        return {"error": str(e), "trace": traceback.format_exc()}
+        return {
+            "error": str(e),
+            "trace": traceback.format_exc()
+        }
 
 
 # =============================
-# LIVE SCANNER
+# LIVE SCANNER LOOP
 # =============================
 def scanner_loop():
     tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"]
@@ -154,13 +160,15 @@ def scanner_loop():
                     "signal": "bullish" if score > 1 else "bearish" if score < -1 else "neutral"
                 })
 
-            except:
-                continue
+            except Exception as e:
+                print("scan error:", t, e)
 
-        scan_cache["data"] = sorted(results, key=lambda x: x["score"], reverse=True)
+        # 🔥 GUARANTEED STRUCTURE
+        scan_cache["data"] = results if results else []
         scan_cache["timestamp"] = time.time()
 
         time.sleep(CACHE_TTL)
+
 
 Thread(target=scanner_loop, daemon=True).start()
 
@@ -173,12 +181,12 @@ def scan():
     return {
         "live": True,
         "last_updated": scan_cache["timestamp"],
-        "data": scan_cache["data"]   # ✅ FIXED KEY (THIS WAS YOUR BUG)
+        "data": scan_cache.get("data", [])   # 🔥 SAFE ALWAYS
     }
 
 
 # =============================
-# DASHBOARD (CLEAN + COMPACT)
+# DASHBOARD (CLEAN + ERROR PROOF)
 # =============================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -187,13 +195,40 @@ def dashboard():
 <html>
 <head>
 <title>Gradient Dashboard</title>
+
 <style>
-body{background:#0b1220;color:white;font-family:Arial;text-align:center}
-.card{background:#111c2e;padding:20px;margin:20px auto;width:260px;border-radius:12px}
-input,button{padding:10px;margin:5px}
-table{margin:auto;width:80%;border-collapse:collapse}
-td,th{padding:10px;border-bottom:1px solid #2a3b55}
+body{
+    background:#0b1220;
+    color:white;
+    font-family:Arial;
+    text-align:center;
+}
+
+.card{
+    background:#111c2e;
+    padding:20px;
+    margin:20px auto;
+    width:260px;
+    border-radius:12px;
+}
+
+input,button{
+    padding:10px;
+    margin:5px;
+}
+
+table{
+    margin:auto;
+    width:80%;
+    border-collapse:collapse;
+}
+
+td,th{
+    padding:10px;
+    border-bottom:1px solid #2a3b55;
+}
 </style>
+
 </head>
 
 <body>
@@ -214,31 +249,40 @@ td,th{padding:10px;border-bottom:1px solid #2a3b55}
 <table id="tbl"></table>
 
 <script>
-async function run(){
- const t=document.getElementById("ticker").value;
- const r=await fetch("/analyze?ticker="+t);
- const d=await r.json();
 
- document.getElementById("t").innerText=d.ticker;
- document.getElementById("s").innerText=d.gradient_score;
- document.getElementById("sig").innerText=d.signal;
+async function run(){
+    const t=document.getElementById("ticker").value;
+
+    const r=await fetch("/analyze?ticker="+t);
+    const d=await r.json();
+
+    document.getElementById("t").innerText = d.ticker || "---";
+    document.getElementById("s").innerText = d.gradient_score ?? 0;
+    document.getElementById("sig").innerText = d.signal || "---";
 }
 
 async function load(){
- const r=await fetch("/scan");
- const d=await r.json();
+    const r=await fetch("/scan");
+    const d=await r.json();
 
- let h="<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
+    const rows = d?.data ?? [];   // 🔥 NO MORE UNDEFINED
 
- (d.data||[]).forEach(x=>{
-   h+=`<tr><td>${x.ticker}</td><td>${x.score}</td><td>${x.signal}</td></tr>`;
- });
+    let h="<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
 
- document.getElementById("tbl").innerHTML=h;
+    rows.forEach(x=>{
+        h += `<tr>
+                <td>${x.ticker}</td>
+                <td>${x.score}</td>
+                <td>${x.signal}</td>
+              </tr>`;
+    });
+
+    document.getElementById("tbl").innerHTML = h;
 }
 
 load();
-setInterval(load,10000);
+setInterval(load, 10000);
+
 </script>
 
 </body>
