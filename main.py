@@ -24,49 +24,48 @@ scan_cache = {
     "timestamp": 0
 }
 
-# =============================
-# IMPROVED GRADIENT ENGINE (STABLE + HYBRID MOMENTUM)
-# =============================
-
 def compute_gradient(df):
     df = df.copy()
 
-    # -----------------------------
-    # MOMENTUM (VOL NORMALIZED)
-    # -----------------------------
-    volatility = df['Close'].rolling(10).std()
-    volatility = volatility.replace(0, np.nan)
+    # -------------------------
+    # BASE FEATURES
+    # -------------------------
+    df['returns'] = df['Close'].pct_change()
+    df['vol'] = df['returns'].rolling(10).std()
 
-    momentum = df['Close'].diff(3)
-    momentum_norm = (momentum / volatility).replace([np.inf, -np.inf], np.nan).fillna(0)
+    df['vol'] = df['vol'].replace(0, np.nan)
+    df['momentum'] = df['returns'] / df['vol']
+    df['momentum'] = df['momentum'].replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    # -----------------------------
-    # STREAK (DIRECTIONAL PRESSURE)
-    # -----------------------------
-    price_change = df['Close'].diff()
+    # -------------------------
+    # REGIME LOGIC (NEW)
+    # -------------------------
 
-    streak = []
-    s = 0
+    # Trend (smoothed momentum)
+    df['trend'] = df['momentum'].rolling(5).mean().fillna(0)
 
-    for d in price_change:
-        if d > 0:
-            s = s + 1 if s > 0 else 1
-        elif d < 0:
-            s = s - 1 if s < 0 else -1
-        else:
-            s = 0
-        streak.append(s)
+    # Acceleration (change in momentum)
+    df['accel'] = df['momentum'].diff().fillna(0)
 
-    streak = np.array(streak)
+    # Volume confirmation (SAFE: only if exists)
+    if 'Volume' in df.columns:
+        df['vol_ma'] = df['Volume'].rolling(10).mean()
+        df['vol_boost'] = np.where(df['Volume'] > df['vol_ma'], 1, 0)
+    else:
+        df['vol_boost'] = 0
 
-    # -----------------------------
-    # FINAL GRADIENT (STABLE HYBRID)
-    # -----------------------------
-    raw = np.tanh(momentum_norm) * 5 + np.tanh(streak / 5) * 2
+    # -------------------------
+    # FINAL SCORE
+    # -------------------------
+    regime_raw = (
+        0.6 * df['trend'] +
+        0.3 * df['accel'] +
+        0.1 * df['vol_boost']
+    )
 
-    raw = np.clip(raw, -5, 5)
+    df['gradient'] = np.tanh(regime_raw) * 5
 
-    return raw
+    return df['gradient'].values
 
 # =============================
 # LIVE CACHE HELPERS
@@ -180,173 +179,69 @@ def scan():
     }
 
 # =============================
-# DASHBOARD
+# DASHBOARD (NEW FRONTEND)
 # =============================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     html = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Gradient Heat Dashboard</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Gradient Heat Dashboard</title>
+        <style>
+            body { font-family: Arial; background:#0f172a; color:white; text-align:center; }
+            input, button { padding:10px; margin:5px; font-size:16px; }
+            .card { margin-top:20px; padding:20px; background:#1e293b; display:inline-block; border-radius:10px; }
+            table { margin:auto; margin-top:20px; border-collapse: collapse; }
+            td, th { padding:10px 20px; border-bottom:1px solid #334155; }
+        </style>
+    </head>
+    <body>
+        <h1>🔥 Gradient Heat Dashboard</h1>
 
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-
-        html, body {
-            margin: 0;
-            padding: 0;
-            width: 100%;
-            background: radial-gradient(circle at top, #0f1a2b, #0b1220);
-            color: #ffffff;
-            font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, Arial;
-            overflow-x: hidden;
-            text-align: center;
-        }
-
-        .container {
-            width: 100%;
-            max-width: 1100px;
-            margin: 0 auto;
-            padding: 80px 20px;
-        }
-
-        h1 {
-            font-size: 42px;
-            margin-bottom: 10px;
-            font-weight: 700;
-        }
-
-        .subtitle {
-            color: #9aa4b2;
-            margin: 0 auto 30px auto;
-            font-size: 16px;
-            line-height: 1.6;
-            max-width: 750px;
-        }
-
-        .input-row {
-            display: flex;
-            justify-content: center;
-            gap: 12px;
-            margin-bottom: 35px;
-            flex-wrap: wrap;
-        }
-
-        input {
-            padding: 14px 16px;
-            font-size: 16px;
-            border-radius: 12px;
-            border: 1px solid #263244;
-            background: #0f1a2b;
-            color: white;
-            width: 260px;
-            text-align: center;
-            outline: none;
-        }
-
-        button {
-            padding: 14px 20px;
-            font-size: 16px;
-            border-radius: 12px;
-            border: none;
-            background: linear-gradient(135deg, #22c55e, #16a34a);
-            color: black;
-            font-weight: 700;
-            cursor: pointer;
-        }
-
-        .card {
-            margin: 0 auto 40px auto;
-            padding: 34px;
-            background: #111c2e;
-            border-radius: 16px;
-            max-width: 320px;
-            box-shadow: 0 12px 40px rgba(0,0,0,0.55);
-        }
-
-        #symbol { font-size: 20px; color: #cbd5e1; }
-        #score { font-size: 56px; font-weight: 700; }
-        #signal { font-size: 16px; color: #9aa4b2; }
-
-        table {
-            margin: 30px auto;
-            width: 100%;
-            max-width: 900px;
-            border-collapse: collapse;
-            background: #0f1a2b;
-        }
-
-        th, td {
-            padding: 14px;
-            border-bottom: 1px solid #1f2a3a;
-        }
-
-        th { color: #cbd5e1; }
-        td { color: #e2e8f0; }
-    </style>
-</head>
-<body>
-
-<div class="container">
-
-    <h1>🔥 Gradient Heat Dashboard</h1>
-
-    <div class="subtitle">
-        Real-time momentum + structure scoring system measuring trend strength and reversal pressure.
-    </div>
-
-    <div class="input-row">
         <input id="ticker" placeholder="Enter ticker (AAPL)" />
         <button onclick="analyze()">Analyze</button>
-    </div>
 
-    <div class="card">
-        <div id="symbol">---</div>
-        <div id="score">0</div>
-        <div id="signal">---</div>
-    </div>
+        <div class="card">
+            <h2 id="symbol">---</h2>
+            <h1 id="score">0</h1>
+            <div id="signal">---</div>
+        </div>
 
-    <button onclick="loadScan()">Refresh Scan</button>
+        <h2>📊 Live Heatmap</h2>
+        <button onclick="loadScan()">Refresh Scan</button>
+        <table id="table"></table>
 
-    <table id="table"></table>
+        <script>
+        async function analyze() {
+            const t = document.getElementById('ticker').value;
+            const res = await fetch(`/analyze?ticker=${t}`);
+            const data = await res.json();
 
-</div>
+            document.getElementById('symbol').innerText = data.ticker;
+            document.getElementById('score').innerText = data.gradient_score;
+            document.getElementById('signal').innerText = data.signal;
+        }
 
-<script>
-const API = window.location.origin;
+        async function loadScan() {
+            const res = await fetch('/scan');
+            const data = await res.json();
 
-async function analyze() {
-    const t = document.getElementById('ticker').value;
-    const res = await fetch(`${API}/analyze?ticker=${t}`);
-    const data = await res.json();
+            let html = '<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>';
 
-    document.getElementById('symbol').innerText = data.ticker;
-    document.getElementById('score').innerText = data.gradient_score;
-    document.getElementById('signal').innerText = data.signal;
-}
+            data.results.forEach(r => {
+                html += `<tr><td>${r.ticker}</td><td>${r.score}</td><td>${r.signal}</td></tr>`;
+            });
 
-async function loadScan() {
-    const res = await fetch(`${API}/scan`);
-    const data = await res.json();
+            document.getElementById('table').innerHTML = html;
+        }
 
-    let html = '<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>';
-
-    (data.results || []).forEach(r => {
-        html += `<tr><td>${r.ticker}</td><td>${r.score}</td><td>${r.signal}</td></tr>`;
-    });
-
-    document.getElementById('table').innerHTML = html;
-}
-
-loadScan();
-setInterval(loadScan, 15000);
-</script>
-
-</body>
-</html>
-"""
+        loadScan();
+        setInterval(loadScan, 15000);
+        </script>
+    </body>
+    </html>
+    """
     return HTMLResponse(content=html)
 
 # =============================
