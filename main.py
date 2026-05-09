@@ -27,9 +27,9 @@ scan_cache = {
 def compute_gradient(df):
     df = df.copy()
 
-    # -------------------------
-    # BASE FEATURES
-    # -------------------------
+    # =============================
+    # BASE FEATURES (UNCHANGED CORE)
+    # =============================
     df['returns'] = df['Close'].pct_change()
     df['vol'] = df['returns'].rolling(10).std()
 
@@ -37,35 +37,103 @@ def compute_gradient(df):
     df['momentum'] = df['returns'] / df['vol']
     df['momentum'] = df['momentum'].replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    # -------------------------
-    # REGIME LOGIC (NEW)
-    # -------------------------
-
-    # Trend (smoothed momentum)
     df['trend'] = df['momentum'].rolling(5).mean().fillna(0)
-
-    # Acceleration (change in momentum)
     df['accel'] = df['momentum'].diff().fillna(0)
 
-    # Volume confirmation (SAFE: only if exists)
+    # Volume confirmation
     if 'Volume' in df.columns:
         df['vol_ma'] = df['Volume'].rolling(10).mean()
         df['vol_boost'] = np.where(df['Volume'] > df['vol_ma'], 1, 0)
     else:
         df['vol_boost'] = 0
 
-    # -------------------------
-    # FINAL SCORE
-    # -------------------------
-    regime_raw = (
-        0.6 * df['trend'] +
+    # =============================
+    # 3-DAY CANDLE STRUCTURE LOGIC
+    # =============================
+    N = 3
+
+    engulf_signal = np.zeros(len(df))
+    pattern_signal = np.zeros(len(df))
+
+    for i in range(2 * N, len(df)):
+
+        first = df.iloc[i-2*N:i-N]
+        second = df.iloc[i-N:i]
+
+        # -------- 3-day aggregation --------
+        f_open = first['Open'].iloc[0]
+        f_close = first['Close'].iloc[-1]
+        f_high = first['High'].max()
+        f_low = first['Low'].min()
+        f_body = abs(f_close - f_open)
+        f_range = f_high - f_low
+
+        s_open = second['Open'].iloc[0]
+        s_close = second['Close'].iloc[-1]
+        s_high = second['High'].max()
+        s_low = second['Low'].min()
+        s_body = abs(s_close - s_open)
+        s_range = s_high - s_low
+
+        # Volume filter
+        if 'Volume' in df.columns:
+            vol_ok = second['Volume'].sum() >= 1.2 * first['Volume'].mean() * N
+        else:
+            vol_ok = True
+
+        # =============================
+        # 3-DAY ENGULFING
+        # =============================
+
+        # Bullish engulf
+        if (
+            f_close < f_open and f_body >= 0.5 * f_range and
+            s_close > s_open and s_body >= 0.6 * s_range and
+            s_close > f_open and vol_ok
+        ):
+            engulf_signal[i-N:i] = 1
+
+        # Bearish engulf
+        if (
+            f_close > f_open and f_body >= 0.5 * f_range and
+            s_close < s_open and s_body >= 0.6 * s_range and
+            s_close < f_open and vol_ok
+        ):
+            engulf_signal[i-N:i] = -1
+
+        # =============================
+        # 3x3 STRUCTURE SHIFT (TREND BREAK)
+        # =============================
+
+        if (
+            f_close < f_open and s_body < f_body * 0.3 and s_close > s_open
+        ):
+            pattern_signal[i] = 1
+
+        if (
+            f_close > f_open and s_body < f_body * 0.3 and s_close < s_open
+        ):
+            pattern_signal[i] = -1
+
+    # =============================
+    # COMBINE STRUCTURE SIGNALS
+    # =============================
+    structure = engulf_signal + pattern_signal
+
+    # =============================
+    # FINAL GRADIENT (CONSISTENT SCALE)
+    # =============================
+    raw = (
+        0.5 * df['trend'] +
         0.3 * df['accel'] +
-        0.1 * df['vol_boost']
+        0.1 * df['vol_boost'] +
+        0.6 * structure
     )
 
-    df['gradient'] = np.tanh(regime_raw) * 5
+    # normalize + clamp to same range (-5 to 5)
+    gradient = np.tanh(raw) * 5
 
-    return df['gradient'].values
+    return gradient.values
 
 # =============================
 # LIVE CACHE HELPERS
