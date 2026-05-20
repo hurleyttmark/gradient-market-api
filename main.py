@@ -6,7 +6,6 @@ import traceback
 import time
 from threading import Thread
 from fastapi.responses import HTMLResponse
-
 import matplotlib.pyplot as plt
 import io
 import base64
@@ -14,24 +13,23 @@ import base64
 app = FastAPI()
 
 # =============================
-# CORE SETTINGS
+# CACHE
 # =============================
-CACHE_TTL = 60
-
 cache = {}
 scan_cache = {"data": None, "timestamp": 0}
 
+CACHE_TTL = 60
+
+
 # =============================
-# 3-DAY GRADIENT ENGINE (UNCHANGED)
+# GRADIENT ENGINE
 # =============================
 def compute_gradient(df):
 
     df = df.copy()
 
     df['close_3d'] = df['Close'].pct_change(3)
-
-    df['volatility'] = df['close_3d'].rolling(20).std()
-    df['volatility'] = df['volatility'].replace(0, np.nan)
+    df['volatility'] = df['close_3d'].rolling(20).std().replace(0, np.nan)
 
     df['momentum'] = (
         df['close_3d'] / df['volatility']
@@ -40,15 +38,13 @@ def compute_gradient(df):
     streak = []
     s = 0
 
-    for val in df['close_3d'].fillna(0):
-
-        if val > 0:
+    for v in df['close_3d'].fillna(0):
+        if v > 0:
             s = s + 1 if s > 0 else 1
-        elif val < 0:
+        elif v < 0:
             s = s - 1 if s < 0 else -1
         else:
             s = 0
-
         streak.append(s)
 
     df['streak'] = streak
@@ -59,34 +55,20 @@ def compute_gradient(df):
     df['vol_ma'] = df['Volume'].rolling(20).mean()
     df['vol_boost'] = np.where(df['Volume'] > df['vol_ma'], 1, 0)
 
-    regime_raw = (
+    regime = (
         0.55 * df['trend'] +
         0.30 * np.tanh(df['streak'] / 4) +
         0.10 * df['accel'] +
         0.05 * df['vol_boost']
     )
 
-    df['gradient'] = np.tanh(regime_raw.rolling(3).mean().fillna(0)) * 5
+    df['gradient'] = np.tanh(regime.rolling(3).mean().fillna(0)) * 5
 
-    return df['gradient'].fillna(0).values
-
-
-# =============================
-# CACHE
-# =============================
-def get_cached(ticker):
-    if ticker in cache:
-        if time.time() - cache[ticker]["time"] < CACHE_TTL:
-            return cache[ticker]["data"]
-    return None
-
-
-def set_cache(ticker, data):
-    cache[ticker] = {"data": data, "time": time.time()}
+    return df['gradient'].values
 
 
 # =============================
-# ANALYZE
+# ANALYZE ENDPOINT (FIXED SAFE OUTPUT)
 # =============================
 @app.get("/analyze")
 def analyze(ticker: str = Query(...)):
@@ -94,31 +76,48 @@ def analyze(ticker: str = Query(...)):
     try:
         ticker = ticker.upper()
 
-        cached = get_cached(ticker)
-        if cached:
-            return cached
-
         df = yf.download(ticker, period="3y", auto_adjust=True, progress=False)
 
         if df is None or df.empty:
-            return {"error": "No data found"}
+            return {
+                "ticker": ticker,
+                "gradient_score": 0,
+                "signal": "neutral"
+            }
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
 
         df = df[['Open','High','Low','Close','Volume']].dropna()
 
         grad = compute_gradient(df)
 
-        result = {
+        if len(grad) == 0:
+            return {
+                "ticker": ticker,
+                "gradient_score": 0,
+                "signal": "neutral"
+            }
+
+        score = float(round(grad[-1], 3))
+
+        return {
             "ticker": ticker,
-            "gradient_score": float(round(grad[-1], 3)),
-            "signal": "bullish" if grad[-1] > 1 else "bearish" if grad[-1] < -1 else "neutral",
-            "cached": False
+            "gradient_score": score,
+            "signal": (
+                "bullish" if score > 1
+                else "bearish" if score < -1
+                else "neutral"
+            )
         }
 
-        set_cache(ticker, result)
-        return result
-
     except Exception as e:
-        return {"error": str(e), "trace": traceback.format_exc()}
+        return {
+            "ticker": ticker,
+            "gradient_score": 0,
+            "signal": "neutral",
+            "error": str(e)
+        }
 
 
 # =============================
@@ -143,13 +142,16 @@ def update_scan_loop():
                 df = df[['Open','High','Low','Close','Volume']].dropna()
 
                 grad = compute_gradient(df)
-
                 score = float(grad[-1])
 
                 results.append({
                     "ticker": t,
                     "score": round(score, 3),
-                    "signal": "bullish" if score > 1 else "bearish" if score < -1 else "neutral"
+                    "signal": (
+                        "bullish" if score > 1
+                        else "bearish" if score < -1
+                        else "neutral"
+                    )
                 })
 
             except:
@@ -173,76 +175,72 @@ def scan():
 
 
 # =============================
-# CHART (CLEAN 3-DAY ARROWS)
+# CHART (FULLY DYNAMIC + SAFE)
 # =============================
 @app.get("/chart")
 def chart(ticker: str = "SPY"):
 
-    df = yf.download(ticker.upper(), period="1y", auto_adjust=True, progress=False)
+    df = yf.download(ticker, period="1y", auto_adjust=True, progress=False)
 
     if df is None or df.empty:
-        return {"error": "No data"}
+        return HTMLResponse("<h3>No data</h3>")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
     df = df[['Open','High','Low','Close','Volume']].dropna()
 
-    # simple direction filter (NO spam)
-    df['signal'] = np.where(df['Close'] > df['Open'], 1, -1)
+    df['bullish_3x3'] = df['Close'] > df['Open']
+    df['bearish_3x3'] = df['Close'] < df['Open']
 
-    fig, ax = plt.subplots(figsize=(12,6))
+    fig, ax = plt.subplots(figsize=(10,5), dpi=120)
 
-    ax.plot(df.index, df['Close'], color='black', linewidth=2)
+    ax.plot(df.index, df['Close'], color='black', linewidth=1.5)
 
     price_range = df['High'].max() - df['Low'].min()
-    arrow_size = price_range * 0.015
+    arrow = price_range * 0.02
 
     for i in range(len(df)):
 
-        # ONLY show arrows when real directional change happens (clean version)
-        if i < 2:
-            continue
-
-        prev = df['Close'].iloc[i-1]
-        curr = df['Close'].iloc[i]
-
         x = df.index[i]
 
-        # bullish reversal / continuation
-        if curr > prev:
+        if df['bullish_3x3'].iloc[i]:
             ax.annotate(
                 '',
                 xy=(x, df['Low'].iloc[i]),
-                xytext=(x, df['Low'].iloc[i] - arrow_size),
+                xytext=(x, df['Low'].iloc[i] - arrow),
                 arrowprops=dict(color='green', arrowstyle='simple')
             )
 
-        # bearish
-        else:
+        if df['bearish_3x3'].iloc[i]:
             ax.annotate(
                 '',
                 xy=(x, df['High'].iloc[i]),
-                xytext=(x, df['High'].iloc[i] + arrow_size),
+                xytext=(x, df['High'].iloc[i] + arrow),
                 arrowprops=dict(color='red', arrowstyle='simple')
             )
 
-    ax.set_title(f"{ticker} Price Action (Clean Signals)")
+    ax.set_title(f"{ticker} Price Chart")
     ax.grid(alpha=0.2)
 
     buf = io.BytesIO()
     plt.tight_layout()
-    plt.savefig(buf, format='png')
+    plt.savefig(buf, format="png", bbox_inches="tight")
     buf.seek(0)
 
-    img = base64.b64encode(buf.read()).decode("utf-8")
+    img = base64.b64encode(buf.read()).decode()
     plt.close()
 
     return HTMLResponse(f"""
-    <img style="width:100%;height:100%;object-fit:contain"
-         src="data:image/png;base64,{img}">
+    <div style="width:100%;height:100%;display:flex;">
+        <img src="data:image/png;base64,{img}"
+             style="width:100%;height:100%;object-fit:contain;">
+    </div>
     """)
 
 
 # =============================
-# DASHBOARD (LEFT = SCAN, RIGHT = CHART)
+# DASHBOARD (FIXED + SYNCED)
 # =============================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -251,66 +249,72 @@ def dashboard():
 <!DOCTYPE html>
 <html>
 <head>
-<title>Gradient Dashboard</title>
-
 <style>
 
 body {
-    margin: 0;
-    background: #0b0f14;
-    color: white;
-    font-family: Arial;
-    height: 100vh;
-    overflow: hidden;
+    margin:0;
+    height:100vh;
+    display:flex;
+    flex-direction:column;
+    overflow:hidden;
+    background:#0b0f14;
+    color:white;
+    font-family:Arial;
+}
+
+.header {
+    height:40px;
+    line-height:40px;
+    padding-left:10px;
+    border-bottom:1px solid #1f2a37;
 }
 
 .container {
-    display: flex;
-    height: 100vh;
+    flex:1;
+    display:flex;
+    min-height:0;
 }
 
 .left {
-    width: 30%;
-    padding: 10px;
-    background: #0f141b;
-    overflow: hidden;
+    width:25%;
+    padding:10px;
+    overflow:auto;
+    border-right:1px solid #1f2a37;
 }
 
 .right {
-    width: 70%;
+    flex:1;
+    min-width:0;
 }
 
 iframe {
-    width: 100%;
-    height: 100%;
-    border: none;
-}
-
-.card {
-    background: #111827;
-    padding: 10px;
-    border-radius: 10px;
-    margin-bottom: 10px;
+    width:100%;
+    height:100%;
+    border:none;
 }
 
 table {
-    width: 100%;
-    font-size: 12px;
+    width:100%;
+    font-size:12px;
 }
 
-td, th {
-    border-bottom: 1px solid #1f2a37;
-    padding: 5px;
+td,th {
+    border-bottom:1px solid #1f2a37;
+    padding:5px;
 }
 
 button {
-    padding: 6px;
-    margin-top: 5px;
+    margin-top:5px;
+    background:#1f2937;
+    color:white;
+    border:none;
+    padding:6px;
+    cursor:pointer;
 }
 
 input {
-    width: 100%;
-    padding: 6px;
+    width:100%;
+    padding:6px;
 }
 
 </style>
@@ -318,45 +322,52 @@ input {
 
 <body>
 
+<div class="header">🔥 Gradient Dashboard</div>
+
 <div class="container">
 
 <div class="left">
 
-    <div class="card">
-        <input id="ticker" placeholder="Enter ticker (AAPL)">
-        <button onclick="loadChart()">Load Chart</button>
+<input id="ticker" placeholder="AAPL">
 
-        <div id="symbol">---</div>
-        <div id="score">---</div>
-        <div id="signal">---</div>
-    </div>
+<button onclick="analyze()">Analyze</button>
 
-    <button onclick="loadScan()">Refresh Scan</button>
+<div id="symbol">---</div>
+<div id="score">0</div>
+<div id="signal">---</div>
 
-    <table id="table"></table>
+<button onclick="loadScan()">Refresh Scan</button>
+
+<table id="table"></table>
 
 </div>
 
 <div class="right">
-    <iframe id="chart" src="/chart?ticker=SPY"></iframe>
+<iframe id="chartFrame" src="/chart?ticker=SPY"></iframe>
 </div>
 
 </div>
 
 <script>
 
-async function loadChart(){
+async function analyze(){
 
-    const t = document.getElementById("ticker").value || "SPY";
+    const t = document.getElementById("ticker").value;
 
-    document.getElementById("chart").src = "/chart?ticker=" + t;
+    if(!t){
+        alert("Enter ticker");
+        return;
+    }
 
-    const r = await fetch("/analyze?ticker=" + t);
+    const r = await fetch(`/analyze?ticker=${t}`);
     const d = await r.json();
 
-    document.getElementById("symbol").innerText = d.ticker;
-    document.getElementById("score").innerText = d.gradient_score;
-    document.getElementById("signal").innerText = d.signal;
+    document.getElementById("symbol").innerText = d.ticker || "---";
+    document.getElementById("score").innerText = d.gradient_score ?? 0;
+    document.getElementById("signal").innerText = d.signal || "neutral";
+
+    // FIX: update chart
+    document.getElementById("chartFrame").src = `/chart?ticker=${t}`;
 }
 
 async function loadScan(){
@@ -366,7 +377,7 @@ async function loadScan(){
 
     let html = "<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
 
-    if (d.data){
+    if(d.data){
         d.data.forEach(x=>{
             html += `<tr>
                         <td>${x.ticker}</td>
@@ -380,7 +391,6 @@ async function loadScan(){
 }
 
 loadScan();
-setInterval(loadScan, 15000);
 
 </script>
 
@@ -399,6 +409,6 @@ def root():
     return {
         "dashboard": "/dashboard",
         "analyze": "/analyze?ticker=AAPL",
-        "scan": "/scan",
-        "chart": "/chart?ticker=SPY"
+        "chart": "/chart?ticker=TSLA",
+        "scan": "/scan"
     }
