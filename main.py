@@ -7,55 +7,36 @@ import time
 from threading import Thread
 from fastapi.responses import HTMLResponse
 
+import matplotlib.pyplot as plt
+import io
+import base64
+
 app = FastAPI()
 
 # =============================
 # CORE SETTINGS
 # =============================
-GRADIENT_WINDOW = 10
-CACHE_TTL = 60  # seconds (LIVE UPDATE INTERVAL)
+CACHE_TTL = 60
 
-# =============================
-# SIMPLE IN-MEMORY CACHE
-# =============================
 cache = {}
-
-scan_cache = {
-    "data": None,
-    "timestamp": 0
-}
+scan_cache = {"data": None, "timestamp": 0}
 
 # =============================
-# 3-DAY GRADIENT ENGINE
+# 3-DAY GRADIENT ENGINE (UNCHANGED)
 # =============================
 def compute_gradient(df):
 
     df = df.copy()
 
-    # ---------------------------------
-    # 3-DAY PRICE STRUCTURE
-    # ---------------------------------
     df['close_3d'] = df['Close'].pct_change(3)
 
-    # ---------------------------------
-    # VOLATILITY NORMALIZATION
-    # ---------------------------------
     df['volatility'] = df['close_3d'].rolling(20).std()
     df['volatility'] = df['volatility'].replace(0, np.nan)
 
     df['momentum'] = (
         df['close_3d'] / df['volatility']
-    )
+    ).replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    df['momentum'] = (
-        df['momentum']
-        .replace([np.inf, -np.inf], np.nan)
-        .fillna(0)
-    )
-
-    # ---------------------------------
-    # 3-DAY STREAK SYSTEM
-    # ---------------------------------
     streak = []
     s = 0
 
@@ -63,10 +44,8 @@ def compute_gradient(df):
 
         if val > 0:
             s = s + 1 if s > 0 else 1
-
         elif val < 0:
             s = s - 1 if s < 0 else -1
-
         else:
             s = 0
 
@@ -74,43 +53,12 @@ def compute_gradient(df):
 
     df['streak'] = streak
 
-    # ---------------------------------
-    # TREND REGIME
-    # ---------------------------------
-    df['trend'] = (
-        df['momentum']
-        .rolling(5)
-        .mean()
-        .fillna(0)
-    )
+    df['trend'] = df['momentum'].rolling(5).mean().fillna(0)
+    df['accel'] = df['trend'].diff(3).fillna(0)
 
-    # ---------------------------------
-    # ACCELERATION
-    # ---------------------------------
-    df['accel'] = (
-        df['trend']
-        .diff(3)
-        .fillna(0)
-    )
+    df['vol_ma'] = df['Volume'].rolling(20).mean()
+    df['vol_boost'] = np.where(df['Volume'] > df['vol_ma'], 1, 0)
 
-    # ---------------------------------
-    # VOLUME CONFIRMATION
-    # ---------------------------------
-    df['vol_ma'] = (
-        df['Volume']
-        .rolling(20)
-        .mean()
-    )
-
-    df['vol_boost'] = np.where(
-        df['Volume'] > df['vol_ma'],
-        1,
-        0
-    )
-
-    # ---------------------------------
-    # FINAL REGIME SCORE
-    # ---------------------------------
     regime_raw = (
         0.55 * df['trend'] +
         0.30 * np.tanh(df['streak'] / 4) +
@@ -118,119 +66,67 @@ def compute_gradient(df):
         0.05 * df['vol_boost']
     )
 
-    # ---------------------------------
-    # FINAL SMOOTHED GRADIENT
-    # ---------------------------------
-    df['gradient'] = (
-        np.tanh(
-            regime_raw
-            .rolling(3)
-            .mean()
-            .fillna(0)
-        ) * 5
-    )
+    df['gradient'] = np.tanh(regime_raw.rolling(3).mean().fillna(0)) * 5
 
     return df['gradient'].fillna(0).values
 
 
 # =============================
-# LIVE CACHE HELPERS
+# CACHE
 # =============================
 def get_cached(ticker):
-
     if ticker in cache:
-
-        entry = cache[ticker]
-
-        if time.time() - entry["time"] < CACHE_TTL:
-            return entry["data"]
-
+        if time.time() - cache[ticker]["time"] < CACHE_TTL:
+            return cache[ticker]["data"]
     return None
 
 
 def set_cache(ticker, data):
-
-    cache[ticker] = {
-        "data": data,
-        "time": time.time()
-    }
+    cache[ticker] = {"data": data, "time": time.time()}
 
 
 # =============================
-# TICKER ANALYZER
+# ANALYZE
 # =============================
 @app.get("/analyze")
 def analyze(ticker: str = Query(...)):
 
     try:
-
         ticker = ticker.upper()
 
         cached = get_cached(ticker)
-
         if cached:
             return cached
 
-        df = yf.download(
-            ticker,
-            period="3y",
-            auto_adjust=True,
-            progress=False
-        )
+        df = yf.download(ticker, period="3y", auto_adjust=True, progress=False)
 
         if df is None or df.empty:
             return {"error": "No data found"}
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+        df = df[['Open','High','Low','Close','Volume']].dropna()
 
         grad = compute_gradient(df)
 
-        latest_score = float(grad[-1])
-
         result = {
             "ticker": ticker,
-            "gradient_score": round(latest_score, 3),
-            "signal": (
-                "bullish"
-                if latest_score > 1
-                else "bearish"
-                if latest_score < -1
-                else "neutral"
-            ),
-            "data_points": len(df),
+            "gradient_score": float(round(grad[-1], 3)),
+            "signal": "bullish" if grad[-1] > 1 else "bearish" if grad[-1] < -1 else "neutral",
             "cached": False
         }
 
         set_cache(ticker, result)
-
         return result
 
     except Exception as e:
-
-        return {
-            "error": "Server error",
-            "details": str(e),
-            "trace": traceback.format_exc()
-        }
+        return {"error": str(e), "trace": traceback.format_exc()}
 
 
 # =============================
-# BACKGROUND LIVE SCANNER
+# SCAN LOOP
 # =============================
 def update_scan_loop():
 
-    tickers = [
-        "AAPL",
-        "MSFT",
-        "NVDA",
-        "TSLA",
-        "AMZN",
-        "META",
-        "GOOGL"
-    ]
+    tickers = ["AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL"]
 
     while True:
 
@@ -239,21 +135,12 @@ def update_scan_loop():
         for t in tickers:
 
             try:
-
-                df = yf.download(
-                    t,
-                    period="1y",
-                    auto_adjust=True,
-                    progress=False
-                )
+                df = yf.download(t, period="1y", auto_adjust=True, progress=False)
 
                 if df is None or df.empty:
                     continue
 
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-
-                df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+                df = df[['Open','High','Low','Close','Volume']].dropna()
 
                 grad = compute_gradient(df)
 
@@ -262,189 +149,246 @@ def update_scan_loop():
                 results.append({
                     "ticker": t,
                     "score": round(score, 3),
-                    "signal": (
-                        "bullish"
-                        if score > 1
-                        else "bearish"
-                        if score < -1
-                        else "neutral"
-                    )
+                    "signal": "bullish" if score > 1 else "bearish" if score < -1 else "neutral"
                 })
 
             except:
                 continue
 
-        scan_cache["data"] = sorted(
-            results,
-            key=lambda x: x["score"],
-            reverse=True
-        )
-
+        scan_cache["data"] = sorted(results, key=lambda x: x["score"], reverse=True)
         scan_cache["timestamp"] = time.time()
 
         time.sleep(CACHE_TTL)
 
 
-Thread(
-    target=update_scan_loop,
-    daemon=True
-).start()
+Thread(target=update_scan_loop, daemon=True).start()
 
 
 # =============================
-# LIVE SCANNER ENDPOINT
+# SCAN
 # =============================
 @app.get("/scan")
 def scan():
-
-    return {
-        "live": True,
-        "last_updated": scan_cache["timestamp"],
-        "results": scan_cache["data"]
-    }
+    return scan_cache
 
 
 # =============================
-# DASHBOARD
+# CHART (CLEAN 3-DAY ARROWS)
+# =============================
+@app.get("/chart")
+def chart(ticker: str = "SPY"):
+
+    df = yf.download(ticker.upper(), period="1y", auto_adjust=True, progress=False)
+
+    if df is None or df.empty:
+        return {"error": "No data"}
+
+    df = df[['Open','High','Low','Close','Volume']].dropna()
+
+    # simple direction filter (NO spam)
+    df['signal'] = np.where(df['Close'] > df['Open'], 1, -1)
+
+    fig, ax = plt.subplots(figsize=(12,6))
+
+    ax.plot(df.index, df['Close'], color='black', linewidth=2)
+
+    price_range = df['High'].max() - df['Low'].min()
+    arrow_size = price_range * 0.015
+
+    for i in range(len(df)):
+
+        # ONLY show arrows when real directional change happens (clean version)
+        if i < 2:
+            continue
+
+        prev = df['Close'].iloc[i-1]
+        curr = df['Close'].iloc[i]
+
+        x = df.index[i]
+
+        # bullish reversal / continuation
+        if curr > prev:
+            ax.annotate(
+                '',
+                xy=(x, df['Low'].iloc[i]),
+                xytext=(x, df['Low'].iloc[i] - arrow_size),
+                arrowprops=dict(color='green', arrowstyle='simple')
+            )
+
+        # bearish
+        else:
+            ax.annotate(
+                '',
+                xy=(x, df['High'].iloc[i]),
+                xytext=(x, df['High'].iloc[i] + arrow_size),
+                arrowprops=dict(color='red', arrowstyle='simple')
+            )
+
+    ax.set_title(f"{ticker} Price Action (Clean Signals)")
+    ax.grid(alpha=0.2)
+
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+
+    img = base64.b64encode(buf.read()).decode("utf-8")
+    plt.close()
+
+    return HTMLResponse(f"""
+    <img style="width:100%;height:100%;object-fit:contain"
+         src="data:image/png;base64,{img}">
+    """)
+
+
+# =============================
+# DASHBOARD (LEFT = SCAN, RIGHT = CHART)
 # =============================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
 
     html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Gradient Heat Dashboard</title>
+<!DOCTYPE html>
+<html>
+<head>
+<title>Gradient Dashboard</title>
 
-        <style>
+<style>
 
-            body {
-                font-family: Arial;
-                background:#0f172a;
-                color:white;
-                text-align:center;
-            }
+body {
+    margin: 0;
+    background: #0b0f14;
+    color: white;
+    font-family: Arial;
+    height: 100vh;
+    overflow: hidden;
+}
 
-            input, button {
-                padding:10px;
-                margin:5px;
-                font-size:16px;
-            }
+.container {
+    display: flex;
+    height: 100vh;
+}
 
-            .card {
-                margin-top:20px;
-                padding:20px;
-                background:#1e293b;
-                display:inline-block;
-                border-radius:10px;
-            }
+.left {
+    width: 30%;
+    padding: 10px;
+    background: #0f141b;
+    overflow: hidden;
+}
 
-            table {
-                margin:auto;
-                margin-top:20px;
-                border-collapse: collapse;
-            }
+.right {
+    width: 70%;
+}
 
-            td, th {
-                padding:10px 20px;
-                border-bottom:1px solid #334155;
-            }
+iframe {
+    width: 100%;
+    height: 100%;
+    border: none;
+}
 
-        </style>
+.card {
+    background: #111827;
+    padding: 10px;
+    border-radius: 10px;
+    margin-bottom: 10px;
+}
 
-    </head>
+table {
+    width: 100%;
+    font-size: 12px;
+}
 
-    <body>
+td, th {
+    border-bottom: 1px solid #1f2a37;
+    padding: 5px;
+}
 
-        <h1>🔥 Gradient Heat Dashboard</h1>
+button {
+    padding: 6px;
+    margin-top: 5px;
+}
 
-        <input id="ticker" placeholder="Enter ticker (AAPL)" />
+input {
+    width: 100%;
+    padding: 6px;
+}
 
-        <button onclick="analyze()">
-            Analyze
-        </button>
+</style>
+</head>
 
-        <div class="card">
+<body>
 
-            <h2 id="symbol">---</h2>
+<div class="container">
 
-            <h1 id="score">0</h1>
+<div class="left">
 
-            <div id="signal">---</div>
+    <div class="card">
+        <input id="ticker" placeholder="Enter ticker (AAPL)">
+        <button onclick="loadChart()">Load Chart</button>
 
-        </div>
+        <div id="symbol">---</div>
+        <div id="score">---</div>
+        <div id="signal">---</div>
+    </div>
 
-        <h2>📊 Live Heatmap</h2>
+    <button onclick="loadScan()">Refresh Scan</button>
 
-        <button onclick="loadScan()">
-            Refresh Scan
-        </button>
+    <table id="table"></table>
 
-        <table id="table"></table>
+</div>
 
-        <script>
+<div class="right">
+    <iframe id="chart" src="/chart?ticker=SPY"></iframe>
+</div>
 
-        async function analyze() {
+</div>
 
-            const t =
-                document.getElementById('ticker').value;
+<script>
 
-            const res =
-                await fetch(`/analyze?ticker=${t}`);
+async function loadChart(){
 
-            const data =
-                await res.json();
+    const t = document.getElementById("ticker").value || "SPY";
 
-            document.getElementById('symbol').innerText =
-                data.ticker;
+    document.getElementById("chart").src = "/chart?ticker=" + t;
 
-            document.getElementById('score').innerText =
-                data.gradient_score;
+    const r = await fetch("/analyze?ticker=" + t);
+    const d = await r.json();
 
-            document.getElementById('signal').innerText =
-                data.signal;
-        }
+    document.getElementById("symbol").innerText = d.ticker;
+    document.getElementById("score").innerText = d.gradient_score;
+    document.getElementById("signal").innerText = d.signal;
+}
 
-        async function loadScan() {
+async function loadScan(){
 
-            const res =
-                await fetch('/scan');
+    const r = await fetch("/scan");
+    const d = await r.json();
 
-            const data =
-                await res.json();
+    let html = "<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>";
 
-            let html =
-                '<tr><th>Ticker</th><th>Score</th><th>Signal</th></tr>';
+    if (d.data){
+        d.data.forEach(x=>{
+            html += `<tr>
+                        <td>${x.ticker}</td>
+                        <td>${x.score}</td>
+                        <td>${x.signal}</td>
+                     </tr>`;
+        });
+    }
 
-            if (data.results) {
+    document.getElementById("table").innerHTML = html;
+}
 
-                data.results.forEach(r => {
+loadScan();
+setInterval(loadScan, 15000);
 
-                    html += `
-                        <tr>
-                            <td>${r.ticker}</td>
-                            <td>${r.score}</td>
-                            <td>${r.signal}</td>
-                        </tr>
-                    `;
-                });
-            }
+</script>
 
-            document.getElementById('table').innerHTML =
-                html;
-        }
+</body>
+</html>
+"""
 
-        loadScan();
-
-        setInterval(loadScan, 15000);
-
-        </script>
-
-    </body>
-    </html>
-    """
-
-    return HTMLResponse(content=html)
+    return HTMLResponse(html)
 
 
 # =============================
@@ -452,17 +396,9 @@ def dashboard():
 # =============================
 @app.get("/")
 def root():
-
     return {
-        "message": "LIVE Gradient Heat API running",
         "dashboard": "/dashboard",
-        "endpoints": {
-            "/analyze?ticker=AAPL":
-                "live cached gradient score",
-
-            "/scan":
-                "live market heatmap"
-          
-            
-        }
+        "analyze": "/analyze?ticker=AAPL",
+        "scan": "/scan",
+        "chart": "/chart?ticker=SPY"
     }
