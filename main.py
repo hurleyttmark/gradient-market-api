@@ -462,56 +462,7 @@ def root():
 
             "/scan":
                 "live market heatmap"
-            @app.get("/chart")
-def chart(ticker: str = Query(...)):
-    ticker = ticker.upper()
-
-    df = yf.download(ticker, period="6mo", auto_adjust=True, progress=False)
-
-    if df is None or df.empty:
-        return {"error": "No data"}
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    df = df[['Open','High','Low','Close']].dropna()
-
-    # --- reuse candle logic (simplified but consistent) ---
-    df['range'] = df['High'] - df['Low']
-    df['body'] = abs(df['Close'] - df['Open'])
-    df['body_pct'] = df['body'] / df['range'].replace(0, np.nan)
-
-    def candle_signal(r):
-        if r['range'] == 0:
-            return 0
-
-        if r['body_pct'] <= 0.2:
-            return 0
-
-        body = r['Close'] - r['Open']
-        body_abs = abs(body)
-
-        if body > 0:
-            if body_abs / r['range'] >= 0.25:
-                return 1
-
-        if body < 0:
-            if body_abs / r['range'] >= 0.25:
-                return -1
-
-        return 0
-
-    df['signal'] = df.apply(candle_signal, axis=1)
-
-    return {
-        "ticker": ticker,
-        "index": df.index.astype(str).tolist(),
-        "open": df['Open'].tolist(),
-        "high": df['High'].tolist(),
-        "low": df['Low'].tolist(),
-        "close": df['Close'].tolist(),
-        "signal": df['signal'].tolist()
-    }
+          
             
         }
     }
